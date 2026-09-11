@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { VERSION as PI_HOST_VERSION } from "@earendil-works/pi-coding-agent";
 import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
+import { XAI_SUBSCRIPTION_USAGE_URL } from "../usage.ts";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
@@ -264,6 +265,13 @@ function legacyCodexAccessToken(
 				chatgpt_user_id: userId,
 			},
 		}),
+	).toString("base64url");
+	return `eyJhbGciOiJub25lIn0.${payload}.${tokenVersion}`;
+}
+
+function xaiAccessToken(userId: string, tokenVersion = "1"): string {
+	const payload = Buffer.from(
+		JSON.stringify({ sub: userId, principal_id: userId }),
 	).toString("base64url");
 	return `eyJhbGciOiJub25lIn0.${payload}.${tokenVersion}`;
 }
@@ -988,6 +996,165 @@ test(
 				!state.exhaustedUntilByProvider?.["openai-codex-account-2"] &&
 					!state.exhaustedUntilByProvider?.["openai-codex-account-3"],
 				"fresh headroom after a plan change must clear both stale cooldowns",
+			);
+		} finally {
+			await t.fire("session_shutdown");
+			globalThis.fetch = originalFetch;
+		}
+	},
+);
+
+test(
+	"startup refreshes active xAI usage and survives a concurrent OAuth rotation",
+	{ concurrency: false },
+	async () => {
+		const now = Date.now();
+		const staleAccess = xaiAccessToken("xai-user-123", "stale");
+		const winnerAccess = xaiAccessToken("xai-user-123", "race-winner");
+		const freshAccess = xaiAccessToken("xai-user-123", "fresh");
+		let billingRequests = 0;
+		let refreshRequests = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url === XAI_SUBSCRIPTION_USAGE_URL) {
+				billingRequests++;
+				const headers = new Headers(init?.headers);
+				assert.equal(headers.get("x-userid"), "xai-user-123");
+				if (billingRequests === 1) return new Response("{}", { status: 401 });
+				assert.equal(headers.get("Authorization"), `Bearer ${freshAccess}`);
+				return new Response(
+					JSON.stringify({
+						config: {
+							creditUsagePercent: 25,
+							currentPeriod: {
+								start: new Date(now - 86_400_000).toISOString(),
+								end: new Date(now + 6 * 86_400_000).toISOString(),
+							},
+						},
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			if (url === "https://auth.x.ai/oauth2/token") {
+				refreshRequests++;
+				assert.equal(init?.method, "POST");
+				const body = String(init?.body);
+				assert.match(body, /grant_type=refresh_token/);
+				if (refreshRequests === 1) {
+					assert.match(body, /refresh_token=xai-refresh/);
+					writeFileSync(
+						AUTH,
+						JSON.stringify({
+							xai: {
+								type: "oauth",
+								access: winnerAccess,
+								refresh: "winner-refresh",
+							},
+						}),
+					);
+					return new Response(
+						JSON.stringify({ error: "invalid_grant" }),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				}
+				assert.match(body, /refresh_token=winner-refresh/);
+				return new Response(
+					JSON.stringify({
+						access_token: freshAccess,
+						refresh_token: "rotated-xai-refresh",
+						expires_in: 3_600,
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			throw new Error(`unexpected request: ${url}`);
+		}) as typeof fetch;
+
+		const t = setup({
+			accounts: {
+				xai: {
+					type: "oauth",
+					access: staleAccess,
+					refresh: "xai-refresh",
+				},
+			},
+			current: { provider: "xai", id: "grok-4.6" },
+			config: { showUsage: true },
+			hostAuthStorage: "pi-0.84",
+		});
+
+		try {
+			await t.fire("session_start");
+			assert.equal(billingRequests, 2, "the 401 must be retried with fresh OAuth");
+			assert.equal(
+				refreshRequests,
+				2,
+				"invalid_grant must retry with the refresh token another session stored",
+			);
+			const stored = JSON.parse(readFileSync(AUTH, "utf8")).xai;
+			assert.equal(stored.access, freshAccess);
+			assert.equal(stored.refresh, "rotated-xai-refresh");
+			assert.ok(
+				t.rec.statuses.some(
+					({ value }) =>
+						typeof value === "string" &&
+						value.includes("xAI") &&
+						value.includes("75% left"),
+				),
+				`startup must populate the xAI footer; statuses=${JSON.stringify(t.rec.statuses)}`,
+			);
+		} finally {
+			await t.fire("session_shutdown");
+			globalThis.fetch = originalFetch;
+		}
+	},
+);
+
+test(
+	"xAI limits can be requested while the footer is disabled",
+	{ concurrency: false },
+	async () => {
+		const now = Date.now();
+		let billingRequests = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			assert.equal(String(input), XAI_SUBSCRIPTION_USAGE_URL);
+			billingRequests++;
+			return new Response(
+				JSON.stringify({
+					config: {
+						creditUsagePercent: 25,
+						currentPeriod: {
+							start: new Date(now - 86_400_000).toISOString(),
+							end: new Date(now + 6 * 86_400_000).toISOString(),
+						},
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+		const t = setup({
+			accounts: {
+				xai: {
+					type: "oauth",
+					access: xaiAccessToken("xai-user-123"),
+					refresh: "xai-refresh",
+				},
+			},
+			current: { provider: "xai", id: "grok-4.6" },
+			config: { showUsage: false },
+		});
+
+		try {
+			await t.fire("session_start");
+			await t.command("limits");
+			assert.equal(billingRequests, 1);
+			assert.ok(
+				t.rec.notifies.some(
+					(message) => message.includes("Limits for xAI") && message.includes("75% left"),
+				),
+				`limits must work independently of the footer; notifies=${t.rec.notifies.join(" | ")}`,
 			);
 		} finally {
 			await t.fire("session_shutdown");
@@ -8507,6 +8674,60 @@ test("an account with a usage endpoint still honours the recheck ceiling", async
 	assert.ok(
 		minutes <= 11,
 		`a cheaply re-probed account must still come back at the ceiling; got ${minutes}m`,
+	);
+});
+
+test("xAI cooldowns honour the cheap usage-probe recheck ceiling", async () => {
+	const t = setup({
+		accounts: {
+			xai: {
+				type: "oauth",
+				access: xaiAccessToken("xai-user-123"),
+				refresh: "xai-refresh",
+			},
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+		},
+		current: { provider: "xai", id: "grok-4.6" },
+		config: { maxRecheckIntervalMs: 600_000, cooldownMs: 21_600_000 },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"xai",
+		"grok-4.6",
+		"You have reached your usage limit. Try again in ~40000 min.",
+	);
+
+	const until = t.readState().exhaustedUntilByProvider?.xai ?? 0;
+	const minutes = Math.round((until - Date.now()) / 60_000);
+	assert.ok(
+		minutes <= 11,
+		`xAI can be re-probed without spending a user turn; got ${minutes}m`,
+	);
+});
+
+test("an xAI API key is not treated as a cheap subscription usage probe", async () => {
+	const t = setup({
+		accounts: {
+			xai: { type: "api_key", key: "xai-test-key" },
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+		},
+		current: { provider: "xai", id: "grok-4.6" },
+		config: { maxRecheckIntervalMs: 600_000, cooldownMs: 21_600_000 },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"xai",
+		"grok-4.6",
+		"You have reached your usage limit. Try again in ~40000 min.",
+	);
+
+	const until = t.readState().exhaustedUntilByProvider?.xai ?? 0;
+	const minutes = Math.round((until - Date.now()) / 60_000);
+	assert.ok(
+		minutes > 30,
+		`an xAI API key cannot be re-probed without spending a user turn; got ${minutes}m`,
 	);
 });
 

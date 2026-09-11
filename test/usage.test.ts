@@ -535,14 +535,48 @@ test("xAI prefers modern credit percent over legacy monthlyLimit/used", () => {
 	assert.equal(modern?.primary?.usedPercent, 10);
 });
 
-test("xAI does not invent a window without a period end", () => {
+test("xAI does not invent or mix partial period shapes", () => {
 	assert.equal(
 		parseXaiUsageBody("xai", { config: { creditUsagePercent: 12 } }, NOW),
 		undefined,
 	);
+	assert.equal(
+		parseXaiUsageBody(
+			"xai",
+			{
+				config: {
+					creditUsagePercent: 12,
+					currentPeriod: { start: "not-an-instant", end: "2026-06-15T00:00:00Z" },
+					billingPeriodStart: "2026-06-01T00:00:00Z",
+					billingPeriodEnd: "2026-07-01T00:00:00Z",
+				},
+			},
+			NOW,
+		),
+		undefined,
+		"a modern percentage must not borrow legacy period metadata",
+	);
+	assert.equal(
+		parseXaiUsageBody(
+			"xai",
+			{
+				config: {
+					creditUsagePercent: 12,
+					currentPeriod: {
+						start: "2026-05-01T00:00:00Z",
+						end: "2026-05-08T00:00:00Z",
+					},
+				},
+			},
+			NOW,
+		),
+		undefined,
+		"an expired period must not clear a current cooldown with stale headroom",
+	);
 });
 
 test("xAI usage fetch sends conservative headers and never exposes the token", async () => {
+	const now = Date.now();
 	const access = unsignedJwt({
 		sub: "xai-user-123",
 		principal_id: "xai-user-123",
@@ -560,8 +594,8 @@ test("xAI usage fetch sends conservative headers and never exposes the token", a
 					creditUsagePercent: 2,
 					currentPeriod: {
 						type: "USAGE_PERIOD_TYPE_WEEKLY",
-						start: "2026-06-08T00:00:00Z",
-						end: "2026-06-15T00:00:00Z",
+						start: new Date(now - 86_400_000).toISOString(),
+						end: new Date(now + 6 * 86_400_000).toISOString(),
 					},
 				},
 			}),

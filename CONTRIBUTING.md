@@ -5,9 +5,11 @@ requests are welcome. All PRs are reviewed by the maintainer before merge.
 
 ## Ground rules
 
-- **Never include secrets.** This project only handles SHA-256 fingerprints of
-  credentials — never paste tokens, API keys, or `auth.json` contents into
-  issues, PRs, logs, or tests.
+- **Never include secrets.** The extension handles credentials for provider
+  authentication and usage requests and can keep a `0600` private OAuth recovery
+  sidecar while publishing loopback proxies. Credential values never enter
+  rotation state or logs; only SHA-256 fingerprints are persisted there. Never
+  paste tokens, API keys, or `auth.json` contents into issues, PRs, logs, or tests.
 - Keep each PR focused on a single concern.
 - Discuss large or breaking changes in an issue first.
 

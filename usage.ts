@@ -518,6 +518,43 @@ function grokBuildUsagePercent(productUsage: unknown): number | undefined {
 	return undefined;
 }
 
+type XaiUsagePeriod = Pick<UsageWindow, "resetAt" | "windowSeconds">;
+
+function xaiUsagePeriod(value: unknown, fetchedAt: number): XaiUsagePeriod | undefined {
+	const source = record(value);
+	const start = epochMs(source.start);
+	const end = epochMs(source.end);
+	if (
+		start === undefined ||
+		end === undefined ||
+		end <= start ||
+		fetchedAt < start ||
+		fetchedAt >= end
+	) {
+		return undefined;
+	}
+	return {
+		resetAt: end,
+		windowSeconds: Math.round((end - start) / 1000),
+	};
+}
+
+function xaiUsageSnapshot(
+	provider: string,
+	usedPercent: number,
+	period: XaiUsagePeriod,
+	fetchedAt: number,
+	credentialHash?: string,
+): UsageSnapshot {
+	return {
+		provider,
+		family: "xai",
+		fetchedAt,
+		credentialHash,
+		primary: { usedPercent, ...period },
+	};
+}
+
 export function parseXaiUsageBody(
 	provider: string,
 	body: unknown,
@@ -527,48 +564,46 @@ export function parseXaiUsageBody(
 	const source = record(body);
 	if (source.config === undefined || source.config === null) return undefined;
 	const config = record(source.config);
-	const currentPeriod = record(config.currentPeriod);
-	const periodStart = epochMs(currentPeriod.start) ?? epochMs(config.billingPeriodStart);
-	const periodEnd = epochMs(currentPeriod.end) ?? epochMs(config.billingPeriodEnd);
-
-	let usedPercent = percent(config.creditUsagePercent);
-	if (usedPercent === undefined) usedPercent = grokBuildUsagePercent(config.productUsage);
-	if (usedPercent === undefined) {
-		const hasLegacy =
-			config.monthlyLimit !== undefined &&
-			config.monthlyLimit !== null &&
-			config.used !== undefined &&
-			config.used !== null;
-		if (hasLegacy) {
-			const limitValue = finiteNumber(record(config.monthlyLimit).val) ?? 0;
-			const usedValue = finiteNumber(record(config.used).val) ?? 0;
-			if (limitValue > 0) usedPercent = percent((usedValue / limitValue) * 100);
-		}
+	const modernPeriod = xaiUsagePeriod(config.currentPeriod, fetchedAt);
+	let modernUsedPercent = percent(config.creditUsagePercent);
+	if (modernUsedPercent === undefined) {
+		modernUsedPercent = grokBuildUsagePercent(config.productUsage);
 	}
-	if (
-		usedPercent === undefined &&
-		periodStart !== undefined &&
-		periodEnd !== undefined &&
-		periodEnd > periodStart
-	) {
-		usedPercent = 0;
-	}
-	if (usedPercent === undefined || periodEnd === undefined) return undefined;
-	const windowSeconds =
-		periodStart !== undefined && periodEnd > periodStart
-			? Math.round((periodEnd - periodStart) / 1000)
+	if (modernUsedPercent !== undefined) {
+		return modernPeriod
+			? xaiUsageSnapshot(
+					provider,
+					modernUsedPercent,
+					modernPeriod,
+					fetchedAt,
+					credentialHash,
+				)
 			: undefined;
-	return {
-		provider,
-		family: "xai",
+	}
+	// The modern endpoint omits the percentage for an unused allowance. Only infer zero when the
+	// complete current period proves that this is the modern response shape.
+	if (modernPeriod) {
+		return xaiUsageSnapshot(provider, 0, modernPeriod, fetchedAt, credentialHash);
+	}
+
+	const legacyPeriod = xaiUsagePeriod(
+		{ start: config.billingPeriodStart, end: config.billingPeriodEnd },
 		fetchedAt,
-		credentialHash,
-		primary: {
-			usedPercent,
-			resetAt: periodEnd,
-			...(windowSeconds !== undefined ? { windowSeconds } : {}),
-		},
-	};
+	);
+	if (!legacyPeriod) return undefined;
+	const monthlyLimit = finiteNumber(record(config.monthlyLimit).val);
+	const used = finiteNumber(record(config.used).val) ?? 0;
+	if (monthlyLimit === undefined || monthlyLimit <= 0 || used < 0) return undefined;
+	const legacyUsedPercent = percent((used / monthlyLimit) * 100);
+	return legacyUsedPercent === undefined
+		? undefined
+		: xaiUsageSnapshot(
+				provider,
+				legacyUsedPercent,
+				legacyPeriod,
+				fetchedAt,
+				credentialHash,
+			);
 }
 
 async function fetchXaiUsageSnapshot(
