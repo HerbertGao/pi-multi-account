@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **SuperGrok / xAI subscription usage in the footer and `/multi-account limits`.** `/login xai` stores SuperGrok / X Premium OAuth as `xai`, but usage families only knew Codex, Anthropic, Ollama, Cursor, Qwen, and Kimi — so the footer said usage was not available. The extension now probes xAI's billing credits endpoint with the OAuth access token, the JWT `sub` / `principal_id` as `x-userid` (never a generic `accountId`), and a truthful `pi-multi-account/<version>` client header rather than an official Grok CLI version. `creditUsagePercent` (or Grok Build `productUsage`, or legacy `used` / `monthlyLimit`) maps onto `UsageSnapshot.primary` with the billing-period reset; long windows label as `7d` / `30d` from their real length. API-key `XAI_API_KEY` slots are reported honestly as having no usage endpoint. This does not add numbered xAI login slots or managed-family rotation; Pi already owns `/login xai`.
+
 ## [1.21.3] — 2026-09-05
 
 - Provider-level payload shaping now covers independent Pi callers: Anthropic base/alias OAuth, Qwen base/alias role compatibility and Cursor session isolation. Native-wire fixtures and clean installed-Pi activation verify the boundary.

@@ -1,4 +1,15 @@
-export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen" | "kimi-coding";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export type UsageFamily =
+	| "codex"
+	| "anthropic"
+	| "ollama"
+	| "cursor"
+	| "qwen"
+	| "kimi-coding"
+	| "xai";
 
 export type UsageWindow = {
 	usedPercent: number;
@@ -100,6 +111,7 @@ export function usageFamily(provider: string): UsageFamily | undefined {
 	if (provider === "cursor" || /^cursor-account-\d+$/.test(provider)) return "cursor";
 	if (provider === "alibaba" || /^alibaba-account-\d+$/.test(provider) || /^qwen/i.test(provider)) return "qwen";
 	if (provider === "kimi-coding" || /^kimi-coding-account-\d+$/.test(provider)) return "kimi-coding";
+	if (provider === "xai" || /^xai-account-\d+$/.test(provider)) return "xai";
 	return undefined;
 }
 
@@ -434,6 +446,199 @@ function fetchCursorUsageSnapshot(
 	};
 }
 
+/** SuperGrok / X Premium OAuth billing probe. Not Cursor Grok and not XAI_API_KEY. */
+export const XAI_SUBSCRIPTION_USAGE_URL =
+	"https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+
+function decodeJwtPayload(token: string): Record<string, any> | undefined {
+	const parts = token.split(".");
+	if (parts.length !== 3) return undefined;
+	try {
+		let payload = parts[1].replaceAll("-", "+").replaceAll("_", "/");
+		payload += "=".repeat((4 - (payload.length % 4)) % 4);
+		const parsed = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
+		return parsed && typeof parsed === "object" ? (parsed as Record<string, any>) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function jwtClaimString(payload: Record<string, any>, key: string): string | undefined {
+	const value = payload[key];
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+/**
+ * xAI billing requires the authenticated user id in `x-userid`.
+ * Read it from the access-token JWT (`sub`, then `principal_id`). Never invent it
+ * and never treat a generic OAuth `accountId` as an xAI user id.
+ */
+export function xaiUserIdFromAccessToken(token: string): string | undefined {
+	const payload = decodeJwtPayload(token);
+	if (!payload) return undefined;
+	return jwtClaimString(payload, "sub") ?? jwtClaimString(payload, "principal_id");
+}
+
+let cachedXaiClientVersion: string | undefined;
+
+/** Truthful host id. Never impersonate an official Grok CLI version. */
+export function xaiHostClientVersion(): string {
+	if (cachedXaiClientVersion) return cachedXaiClientVersion;
+	try {
+		const pkg = JSON.parse(
+			readFileSync(join(dirname(fileURLToPath(import.meta.url)), "package.json"), "utf8"),
+		) as { name?: unknown; version?: unknown };
+		const name =
+			typeof pkg.name === "string" && pkg.name.trim() ? pkg.name.trim() : "pi-multi-account";
+		const version =
+			typeof pkg.version === "string" && pkg.version.trim() ? pkg.version.trim() : undefined;
+		cachedXaiClientVersion = version ? `${name}/${version}` : name;
+	} catch {
+		cachedXaiClientVersion = "pi-multi-account";
+	}
+	return cachedXaiClientVersion;
+}
+
+function isGrokBuildProduct(name: unknown): boolean {
+	if (typeof name !== "string") return false;
+	const normalized = name.trim().toLowerCase().replace(/[_-]/g, "");
+	return normalized === "productgrokbuild" || normalized === "grokbuild";
+}
+
+function grokBuildUsagePercent(productUsage: unknown): number | undefined {
+	if (!Array.isArray(productUsage)) return undefined;
+	for (const item of productUsage) {
+		const product = record(item);
+		if (!isGrokBuildProduct(product.product)) continue;
+		const value = percent(product.usagePercent);
+		if (value !== undefined) return value;
+	}
+	return undefined;
+}
+
+export function parseXaiUsageBody(
+	provider: string,
+	body: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+): UsageSnapshot | undefined {
+	const source = record(body);
+	if (source.config === undefined || source.config === null) return undefined;
+	const config = record(source.config);
+	const currentPeriod = record(config.currentPeriod);
+	const periodStart = epochMs(currentPeriod.start) ?? epochMs(config.billingPeriodStart);
+	const periodEnd = epochMs(currentPeriod.end) ?? epochMs(config.billingPeriodEnd);
+
+	let usedPercent = percent(config.creditUsagePercent);
+	if (usedPercent === undefined) usedPercent = grokBuildUsagePercent(config.productUsage);
+	if (usedPercent === undefined) {
+		const hasLegacy =
+			config.monthlyLimit !== undefined &&
+			config.monthlyLimit !== null &&
+			config.used !== undefined &&
+			config.used !== null;
+		if (hasLegacy) {
+			const limitValue = finiteNumber(record(config.monthlyLimit).val) ?? 0;
+			const usedValue = finiteNumber(record(config.used).val) ?? 0;
+			if (limitValue > 0) usedPercent = percent((usedValue / limitValue) * 100);
+		}
+	}
+	if (
+		usedPercent === undefined &&
+		periodStart !== undefined &&
+		periodEnd !== undefined &&
+		periodEnd > periodStart
+	) {
+		usedPercent = 0;
+	}
+	if (usedPercent === undefined || periodEnd === undefined) return undefined;
+	const windowSeconds =
+		periodStart !== undefined && periodEnd > periodStart
+			? Math.round((periodEnd - periodStart) / 1000)
+			: undefined;
+	return {
+		provider,
+		family: "xai",
+		fetchedAt,
+		credentialHash,
+		primary: {
+			usedPercent,
+			resetAt: periodEnd,
+			...(windowSeconds !== undefined ? { windowSeconds } : {}),
+		},
+	};
+}
+
+async function fetchXaiUsageSnapshot(
+	provider: string,
+	credential: UsageCredential,
+	options: {
+		fetchImpl?: typeof fetch;
+		timeoutMs?: number;
+		credentialHash?: string;
+	} = {},
+): Promise<UsageSnapshot> {
+	if (credential.type !== "oauth" || !credential.access) {
+		// XAI_API_KEY shares the `xai` provider id. It has no SuperGrok billing session,
+		// so do not fall through to a doomed OAuth probe that blanks the footer.
+		return {
+			provider,
+			family: "xai",
+			fetchedAt: Date.now(),
+			credentialHash: options.credentialHash,
+			plan: "api-key · no usage endpoint",
+		};
+	}
+	const userId = xaiUserIdFromAccessToken(credential.access);
+	if (!userId) {
+		throw new UsageFetchError(`${provider} xAI access token has no user id`);
+	}
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
+	try {
+		const response = await (options.fetchImpl ?? fetch)(XAI_SUBSCRIPTION_USAGE_URL, {
+			method: "GET",
+			headers: {
+				Authorization: `Bearer ${credential.access}`,
+				Accept: "application/json",
+				"X-XAI-Token-Auth": "xai-grok-cli",
+				"x-userid": userId,
+				"x-grok-client-version": xaiHostClientVersion(),
+				"x-grok-client-mode": "headless",
+			},
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			throw new UsageFetchError(
+				`${provider} usage endpoint returned HTTP ${response.status}`,
+				response.status,
+			);
+		}
+		const snapshot = parseXaiUsageBody(
+			provider,
+			await response.json(),
+			Date.now(),
+			options.credentialHash,
+		);
+		if (!snapshot) {
+			throw new UsageFetchError(`${provider} usage endpoint returned no quota window`);
+		}
+		return snapshot;
+	} catch (error) {
+		if (error instanceof UsageFetchError) throw error;
+		if ((error as any)?.name === "AbortError") {
+			throw new UsageFetchError(`${provider} usage request timed out`);
+		}
+		throw new UsageFetchError(
+			`${provider} usage request failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export async function fetchUsageSnapshot(
 	provider: string,
 	credential: UsageCredential,
@@ -480,6 +685,9 @@ export async function fetchUsageSnapshot(
 			credentialHash: options.credentialHash,
 			plan: "api-key · no usage endpoint",
 		};
+	}
+	if (family === "xai") {
+		return fetchXaiUsageSnapshot(provider, credential, options);
 	}
 	if (credential.type !== "oauth" || !credential.access) {
 		throw new UsageFetchError(`${provider} has no OAuth access token`);
@@ -532,6 +740,7 @@ export function providerUsageLabel(provider: string): string {
 	if (provider.startsWith("ollama")) return index ? `Ollama A${index}` : "Ollama";
 	if (provider.startsWith("cursor")) return index ? `Cursor A${index}` : "Cursor";
 	if (provider.startsWith("kimi-coding")) return index ? `Kimi A${index}` : "Kimi";
+	if (provider.startsWith("xai")) return index ? `xAI A${index}` : "xAI";
 	if (provider.startsWith("alibaba") || /^qwen/i.test(provider)) return index ? `Qwen A${index}` : "Qwen/Alibaba";
 	return provider;
 }
@@ -573,7 +782,10 @@ export function windowLabel(
 	if (family === "cursor") return position === "primary" ? "auth" : "7d";
 	if (family === "ollama") return position === "primary" ? "session" : "weekly";
 	const seconds = window.windowSeconds;
-	if (!seconds) return position === "primary" ? "5h" : "7d";
+	if (!seconds) {
+		// xAI meters a billing period, not a 5-hour window. Do not inherit the Codex default.
+		return family === "xai" ? "period" : position === "primary" ? "5h" : "7d";
+	}
 	if (seconds >= 20 * 86_400) return "30d";
 	if (seconds >= 6 * 86_400) return "7d";
 	if (seconds >= 20 * 3_600) return "24h";

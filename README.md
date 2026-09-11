@@ -16,7 +16,7 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 - **Session-bound overnight resume**: if every account is cooling down, the live Pi session waits for the earliest recovery and continues automatically. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
 - **Deduplicates provably identical accounts** so duplicate Codex workspace memberships and identical credentials do not consume multiple rotation slots or get separate cooldowns. Different users in one Team/Business workspace remain distinct. New provable duplicate logins are rejected before the redundant slot is saved.
 - **Keeps YOUR reasoning level across switches.** Whatever the session runs at — your Pi default, `/thinking`, or a per-agent `--thinking low` — is preserved and restored after every account/model switch, so it never drifts downward when a weaker fallback model clamps it. The extension does not override your level (set `reasoningLevel` if you *want* a forced one), and extreme levels such as `xhigh` / Max / Ultra are never forced.
-- **Shows live limits for the active account** in Pi's footer: remaining 5-hour/session and weekly allowance plus reset countdowns for Codex, Anthropic, and Ollama Cloud accounts.
+- **Shows live limits for the active account** in Pi's footer: remaining 5-hour/session and weekly allowance plus reset countdowns for Codex, Anthropic, and Ollama Cloud accounts, and SuperGrok / xAI subscription credit usage for `/login xai` OAuth (not Cursor Grok, not `XAI_API_KEY`).
 
 ## Install
 
@@ -135,7 +135,7 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `childProxy` | `true` | Serve OAuth rotation slots to processes that do not load this extension (a memory extension consolidating its notes, an external CLI, any `pi -p --no-extensions` call) through a loopback route this process owns. A bare child launched without `--model` inherits Pi's **saved global default**, which since Pi 0.84.3 intentionally may differ from this session's live rotation; an explicitly pinned child uses its requested slot. Without a usable publication either form can fail authentication and fall back to whichever provider Pi finds first. The published route carries a non-secret placeholder; the real credential never leaves the parent. |
 | `providerOrder` | `["anthropic","openai-codex","qwen","ollama"]` | Preferred family order in the rotation. |
 | `cooldownMs` | 6 h | Default cooldown when no reset metadata is provided. |
-| `showUsage` | `true` | Show active Codex/Claude limits in Pi's footer. |
+| `showUsage` | `true` | Show active Codex/Claude/xAI limits in Pi's footer. |
 | `usageRefreshMs` | 5 min | Per-account usage cache TTL; every authenticated rotation account is refreshed independently, and Anthropic is clamped to at least 10 min to avoid endpoint throttling. |
 | `usageStatusRefreshMs` | 1 min | Re-render the footer and sweep idle sessions for stale usage/model catalogs; network refreshes remain limited by their five-minute (Anthropic: ten-minute) TTLs. |
 | `maxAutoContinuesPerPrompt` | `8` | Cap on auto-resume hops per task. |
