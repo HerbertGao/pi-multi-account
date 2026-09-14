@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Codex forced refresh now holds Pi's cross-process credential lock through token exchange and persistence. Concurrent Pi processes adopt the winner's rotated credential instead of reusing the one-use refresh token and forcing another login. Numbered slots update their parent-only OAuth sidecar without exposing credentials in child-facing `auth.json`.
+- Codex now recognizes `refresh_token_reused` as a refresh-rotation error and checks for a newer credential already written by another process.
+
 ## [1.21.3] — 2026-09-05
 
 - Provider-level payload shaping now covers independent Pi callers: Anthropic base/alias OAuth, Qwen base/alias role compatibility and Cursor session isolation. Native-wire fixtures and clean installed-Pi activation verify the boundary.

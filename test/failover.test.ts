@@ -18,10 +18,11 @@ import {
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { VERSION as PI_HOST_VERSION } from "@earendil-works/pi-coding-agent";
 import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
+import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
@@ -8249,11 +8250,21 @@ test("the footer says how many other accounts are ready, so 'switch to what?' ha
 // OAuth refresh: losing a race must not be reported as a dead account
 // ---------------------------------------------------------------------------
 
-const { refreshWithDiskRetry } = (await import("../index.ts")) as {
+const { refreshWithDiskRetry, refreshAndPersistWithStorageLock } = (await import("../index.ts")) as {
 	refreshWithDiskRetry: (opts: {
 		credentials: any;
 		refresh: (credentials: any) => Promise<any>;
 		storedRefresh: () => string | undefined;
+	}) => Promise<any>;
+	refreshAndPersistWithStorageLock: (opts: {
+		provider: string;
+		credentials: any;
+		authStorage: any;
+		readLatest: () => any;
+		refresh: (credentials: any) => Promise<any>;
+		isShadowed?: (stored: any) => boolean;
+		persistShadowed?: (credential: any) => void;
+		signal?: AbortSignal;
 	}) => Promise<any>;
 };
 
@@ -8284,6 +8295,213 @@ test("an invalid_grant is retried with the token another process just wrote", as
 		"the retry must use what is on disk now, not the credential it was handed",
 	);
 	assert.equal(result.access, "new-access", "and the refreshed token is what comes back");
+});
+
+test("Codex refresh_token_reused adopts the token another process just wrote", async () => {
+	const attempts: string[] = [];
+	const result = await refreshWithDiskRetry({
+		credentials: { type: "oauth", access: "old-access", refresh: "stale-refresh" },
+		refresh: async (credentials: any) => {
+			attempts.push(credentials.refresh);
+			if (credentials.refresh === "stale-refresh")
+				throw new Error(
+					'OpenAI Codex token refresh failed (401): {"error":{"code":"refresh_token_reused"}}',
+				);
+			return { access: "new-access", refresh: "newer-refresh", expires: 123 };
+		},
+		storedRefresh: () => "fresh-refresh-from-disk",
+	});
+
+	assert.deepEqual(attempts, ["stale-refresh", "fresh-refresh-from-disk"]);
+	assert.equal(result.access, "new-access");
+});
+
+test("two storage instances serialize Codex refresh and make one network exchange", async () => {
+	const { AuthStorage } = await import(new URL(
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
+	const root = mkdtempSync(join(tmpdir(), "codex-refresh-lock-"));
+	const path = join(root, "auth.json");
+	const provider = "openai-codex-account-3";
+	const oldCredential = {
+		type: "oauth",
+		access: "old-access",
+		refresh: "old-refresh",
+		expires: 1,
+		accountId: "account-3",
+	};
+	writeFileSync(path, JSON.stringify({ [provider]: oldCredential }));
+	const firstStorage = AuthStorage.create(path);
+	const secondStorage = AuthStorage.create(path);
+	let exchanges = 0;
+	let releaseFirst!: () => void;
+	const firstEntered = new Promise<void>((resolve) => { releaseFirst = resolve; });
+	let allowFirst!: () => void;
+	const firstGate = new Promise<void>((resolve) => { allowFirst = resolve; });
+	const refresh = async () => {
+		exchanges++;
+		if (exchanges === 1) {
+			releaseFirst();
+			await firstGate;
+		}
+		return {
+			type: "oauth",
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 86_400_000,
+			accountId: "account-3",
+		};
+	};
+	const readLatest = () => JSON.parse(readFileSync(path, "utf8"))[provider];
+
+	try {
+		const first = refreshAndPersistWithStorageLock({
+			provider,
+			credentials: oldCredential,
+			authStorage: firstStorage,
+			readLatest,
+			refresh,
+		});
+		await firstEntered;
+		const second = refreshAndPersistWithStorageLock({
+			provider,
+			credentials: oldCredential,
+			authStorage: secondStorage,
+			readLatest,
+			refresh,
+		});
+		allowFirst();
+		const [a, b] = await Promise.all([first, second]);
+
+		assert.equal(exchanges, 1, "the second process must adopt the first process's result");
+		assert.equal(a.refresh, "new-refresh");
+		assert.equal(b.refresh, "new-refresh");
+		assert.equal(readLatest().refresh, "new-refresh");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("two OS processes serialize a shadowed Codex refresh through the production sidecar", async () => {
+	const root = mkdtempSync(join(tmpdir(), "codex-refresh-processes-"));
+	const authPath = join(root, "auth.json");
+	const sidecarPath = join(root, "pi-multi-account-proxy-oauth.json");
+	const callsPath = join(root, "refresh-calls.log");
+	const provider = "openai-codex-account-3";
+	const placeholder = childFacingAuthEntryForSlot(provider)!;
+	const oldCredential = {
+		type: "oauth", access: "old-access", refresh: "old-refresh", expires: 1,
+	};
+	writeFileSync(authPath, JSON.stringify({
+		[provider]: placeholder,
+		unrelated: { type: "api_key", key: "keep" },
+	}));
+	writeFileSync(sidecarPath, JSON.stringify({ [provider]: oldCredential }));
+	const indexUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "../index.ts")).href;
+	const authStorageUrl = pathToFileURL(join(
+		dirname(fileURLToPath(import.meta.url)),
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js",
+	)).href;
+	const slotAuthUrl = pathToFileURL(join(
+		dirname(fileURLToPath(import.meta.url)), "../slot-proxy-auth.ts",
+	)).href;
+	const script = `
+		import { appendFileSync } from "node:fs";
+		import { setTimeout as sleep } from "node:timers/promises";
+		import { AuthStorage } from ${JSON.stringify(authStorageUrl)};
+		import {
+			readProxyOAuthSidecar,
+			refreshAndPersistWithStorageLock,
+			writeProxyOAuthSidecar,
+		} from ${JSON.stringify(indexUrl)};
+		import { isChildFacingPlaceholderForSlot } from ${JSON.stringify(slotAuthUrl)};
+		const provider = ${JSON.stringify(provider)};
+		const original = ${JSON.stringify(oldCredential)};
+		const result = await refreshAndPersistWithStorageLock({
+			provider,
+			credentials: original,
+			authStorage: AuthStorage.create(${JSON.stringify(authPath)}),
+			readLatest: () => readProxyOAuthSidecar()[provider],
+			refresh: async (current) => {
+				appendFileSync(${JSON.stringify(callsPath)}, "exchange\\n");
+				await sleep(150);
+				return { ...current, access: "new-access", refresh: "new-refresh", expires: 4102444800000 };
+			},
+			isShadowed: (stored) => isChildFacingPlaceholderForSlot(stored, provider),
+			persistShadowed: (credential) => writeProxyOAuthSidecar({
+				...readProxyOAuthSidecar(), [provider]: credential,
+			}),
+		});
+		if (result.refresh !== "new-refresh") process.exitCode = 2;
+	`;
+	const runChild = () =>
+		new Promise<void>((resolve, reject) => {
+			const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+				cwd: dirname(fileURLToPath(import.meta.url)),
+				env: { ...process.env, PI_CODING_AGENT_DIR: root },
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let stderr = "";
+			child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+			child.on("error", reject);
+			child.on("exit", (code) =>
+				code === 0 ? resolve() : reject(new Error(`refresh child exited ${code}: ${stderr}`)),
+			);
+		});
+
+	try {
+		await Promise.all([runChild(), runChild()]);
+		const calls = readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean);
+		assert.equal(calls.length, 1, "only one process may exchange the one-use token");
+		const auth = JSON.parse(readFileSync(authPath, "utf8"));
+		const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+		assert.deepEqual(auth[provider], placeholder, "OAuth must remain hidden from children");
+		assert.equal(auth.unrelated.key, "keep");
+		assert.equal(sidecar[provider].refresh, "new-refresh");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a shadowed Codex slot updates the sidecar without exposing OAuth in auth.json", async () => {
+	const { AuthStorage } = await import(new URL(
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
+	const root = mkdtempSync(join(tmpdir(), "codex-shadow-refresh-"));
+	const authPath = join(root, "auth.json");
+	const sidecarPath = join(root, "sidecar.json");
+	const provider = "openai-codex-account-3";
+	const placeholder = { type: "api_key", key: "placeholder" };
+	const oldCredential = {
+		type: "oauth", access: "old-access", refresh: "old-refresh", expires: 1,
+	};
+	writeFileSync(authPath, JSON.stringify({ [provider]: placeholder, unrelated: { type: "api_key", key: "keep" } }));
+	writeFileSync(sidecarPath, JSON.stringify({ [provider]: oldCredential }));
+	const storage = AuthStorage.create(authPath);
+
+	try {
+		const result = await refreshAndPersistWithStorageLock({
+			provider,
+			credentials: oldCredential,
+			authStorage: storage,
+			readLatest: () => JSON.parse(readFileSync(sidecarPath, "utf8"))[provider],
+			refresh: async () => ({
+				type: "oauth", access: "new-access", refresh: "new-refresh", expires: Date.now() + 86_400_000,
+			}),
+			isShadowed: (stored) => stored?.type === "api_key",
+			persistShadowed: (credential) => {
+				const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+				writeFileSync(sidecarPath, JSON.stringify({ ...sidecar, [provider]: credential }));
+			},
+		});
+
+		const auth = JSON.parse(readFileSync(authPath, "utf8"));
+		const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+		assert.deepEqual(auth[provider], placeholder);
+		assert.equal(auth.unrelated.key, "keep");
+		assert.equal(sidecar[provider].refresh, "new-refresh");
+		assert.equal(result.refresh, "new-refresh");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("a genuinely revoked token is not retried in a loop", async () => {
