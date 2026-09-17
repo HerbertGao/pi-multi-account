@@ -3380,6 +3380,62 @@ test("a Kimi subscription slot is registered so /login can offer it", async () =
 	);
 });
 
+test("native session model ignores shared preferences on startup, prompts and shutdown", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "low",
+		seedState: { lastUserModel: { provider: "openai-codex", id: "gpt-5.6-sol" }, lastUserThinkingLevel: "max" },
+	});
+	t.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await t.fire("session_start");
+		await t.fire("agent_start");
+		assert.equal(t.ctx.model.provider, "anthropic");
+		assert.equal(t.thinkingLevel(), "low", "another pane cannot supply thinking intent");
+		await t.fire("input", { text: "continue", source: "interactive" });
+		assert.equal(t.ctx.model.provider, "anthropic");
+		assert.deepEqual(t.rec.setModels, []);
+	} finally { await t.fire("session_shutdown"); }
+	assert.equal(JSON.parse(readFileSync(STATE, "utf8")).lastUserModel.provider, "openai-codex",
+		"session shutdown must not publish a pane's live model as a shared default");
+});
+
+test("in-process child activations are passive and root reload reacquires ownership", async () => {
+	const root = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	root.ctx.sessionManager = { getBranch: () => [] };
+	await root.fire("session_start");
+	const child = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	child.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await child.fire("session_start");
+		assert.equal(child.ctx.model.provider, "openai-codex");
+		await finishError(child, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.deepEqual(child.rec.setModels, [], "parent runner alone owns child fallback");
+		assert.equal(child.rec.continueCalls.length, 0);
+	} finally { await child.fire("session_shutdown"); await root.fire("session_shutdown"); }
+	const reloaded = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	reloaded.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await reloaded.fire("session_start", { reason: "reload" });
+		await finishError(reloaded, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+		assert.ok(reloaded.rec.setModels.length > 0, "reload cannot permanently disable root failover");
+	} finally { await reloaded.fire("session_shutdown"); }
+});
+
+test("manual model selection adopts host per-model thinking defaults in auto mode", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "low" });
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	t.ctx.model = { provider: "openai-codex", id: "gpt-5.6-sol" };
+	t.userSetsThinking("high");
+	await t.fire("thinking_level_select", { level: "high", previousLevel: "low" });
+	await t.fire("model_select", { model: t.ctx.model, source: "set" });
+	await t.fire("agent_start");
+	assert.equal(t.thinkingLevel(), "high");
+	await t.fire("session_shutdown");
+});
+
 test("session_start restores lastUserModel after Pi falls back to anthropic/claude-opus-4-8", async () => {
 	installCursorProvider();
 	const t = setup({
@@ -9582,6 +9638,23 @@ test("the context guard trims a mid-run request instead of letting it overflow",
 	assert.equal(String(last.content[0].text).includes("context-guard"), false);
 	// And the transcript Pi holds is untouched — we only shape what goes over the wire.
 	assert.equal(messages[2].content[0].text.length, 20_000);
+});
+
+test("context guard preserves the serialized prefix until the outgoing request crosses the soft line again", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "s".repeat(24_000);
+	const initial = bigConversation(50);
+	const first = await t.fire("context", { messages: initial });
+	assert.ok(first?.messages);
+	for (let turns = 51; turns <= 54; turns++) {
+		const result = await t.fire("context", { messages: bigConversation(turns) });
+		assert.equal(JSON.stringify(result.messages.slice(0, initial.length)), JSON.stringify(first.messages),
+			"small tool turns must not progressively rewrite the cached conversation prefix");
+	}
+	const grown = await t.fire("context", { messages: bigConversation(65) });
+	assert.notEqual(JSON.stringify(grown.messages.slice(0, initial.length)), JSON.stringify(first.messages),
+		"a genuinely full outgoing request still receives another bounded batch");
 });
 
 test("the context guard asks for a real summary only once the agent has settled", async () => {

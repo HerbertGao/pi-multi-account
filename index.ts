@@ -3452,7 +3452,7 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.259";
+const CLAUDE_CODE_VERSION = "2.1.274";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -3834,7 +3834,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// still loads and every non-OAuth account keeps working; only subscription
 	// logins are unavailable, and the user is told once at session start.
 	const oauthUnavailable = piAiOauthUnavailableReason();
-	const subagentChild = isSubagentChildProcess();
+	let subagentChild = isSubagentChildProcess();
+	let hostOwnsSessionModel = false;
+	let startupModel: { provider: string; id: string } | undefined;
+	// A live activation lease, not a permanent first-factory flag: /reload and /new
+	// must be able to acquire root ownership after the previous root shuts down.
+	const activationKey = Symbol.for("pi-multi-account:active-root-session");
+	const activations = globalThis as typeof globalThis & { [activationKey]?: object };
+	const activationOwner = {};
 	const explicitCliArgs = parseExplicitCliArgs();
 	const explicitCli = {
 		model: explicitCliArgs.model !== undefined,
@@ -4376,7 +4383,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					thinkingRank(remembered) >= 0
 						? (remembered as ReasoningLevel)
 						: undefined;
-				desiredThinkingLevel = rememberedLevel ?? actual;
+				desiredThinkingLevel = hostOwnsSessionModel ? actual : rememberedLevel ?? actual;
 				if (desiredThinkingLevel !== actual) {
 					logEvent("thinking_intent_recovered", {
 						observed: actual,
@@ -7038,6 +7045,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function rememberUserModel(model: { provider?: string; id?: string } | undefined) {
 		if (
 			subagentChild ||
+			hostOwnsSessionModel ||
 			!model?.provider ||
 			!model?.id ||
 			(!modelPreferenceChanged && !thinkingPreferenceChanged)
@@ -7064,6 +7072,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function intendedStartupModel(): { provider: string; id: string } | undefined {
+		if (hostOwnsSessionModel) return startupModel;
 		const remembered = persistedState.lastUserModel;
 		if (remembered?.provider && remembered?.id) return remembered;
 		return readHostDefaultModel();
@@ -7117,7 +7126,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const to = ref(intended.provider, intended.id);
 		if (explicitCli.thinking) {
 			desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
-		} else {
+		} else if (!hostOwnsSessionModel) {
 			const rememberedLevel = persistedState.lastUserThinkingLevel;
 			if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
 		}
@@ -7140,9 +7149,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// captured before that reset or the ordinary remembered level.
 			if (explicitCli.thinking) {
 				desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
-			} else {
-				const rememberedLevel = persistedState.lastUserThinkingLevel;
-				if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
+			} else if (config.reasoningLevel === "auto" && hostOwnsSessionModel) {
+				desiredThinkingLevel = readThinkingLevel();
+				thinkingClamp = undefined;
 			}
 			restoreDesiredThinking(ctx);
 			ctx.ui?.notify?.(
@@ -7168,7 +7177,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Pi's createAgentSession often parks us on kimi/anthropic because Cursor was not
 		// in the registry yet. That fallback is not the user's choice — restore first,
 		// otherwise startup preflight failovers *away* from the accidental model.
-		if (intended && !onIntended) {
+		if (!hostOwnsSessionModel && intended && !onIntended) {
 			await restoreRememberedModel(ctx);
 		}
 		if (isCurrentModelReady(ctx)) return true;
@@ -9870,11 +9879,24 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// or the request prefix flips back and forth and the prompt cache is thrown away each turn.
 		if (!decision.trim && contextGuardElided.size === 0) return undefined;
 
-		const plan = planElision(messages as GuardMessage[], contextGuardElided, {
-			targetTokens: decision.trim ? decision.targetTokens : Number.POSITIVE_INFINITY,
+		// Reapply existing stubs BEFORE deciding whether another batch is needed.
+		// Raw transcript growth still drives real compaction, but must not move the
+		// cached prefix on every tool turn while the outgoing request fits (#54).
+		const existing = planElision(messages as GuardMessage[], contextGuardElided, {
+			targetTokens: Number.POSITIVE_INFINITY,
 			keepVerbatimTokens: settings.keepVerbatimTokens,
 			minElideTokens: settings.minElideTokens,
 		});
+		const outgoing = decideGuard(
+			tracker.adjust(estimateRawTokens(existing.messages, systemPrompt)),
+			Number(ctx?.model?.contextWindow ?? 0),
+			settings,
+		);
+		const plan = outgoing.trim ? planElision(messages as GuardMessage[], contextGuardElided, {
+			targetTokens: Math.max(0, outgoing.targetTokens - tracker.overhead() - estimateRawTokens([], systemPrompt)),
+			keepVerbatimTokens: settings.keepVerbatimTokens,
+			minElideTokens: settings.minElideTokens,
+		}) : existing;
 		if (!plan.changed) return undefined;
 		contextGuardTrimmedLastRequest = true;
 		if (plan.elidedNow > 0) {
@@ -10859,7 +10881,24 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_start", async (_event, ctx) => {
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
-		completionRouterContext = ctx;
+		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
+		if (hostOwnsSessionModel && !subagentChild) {
+			if (activations[activationKey] && activations[activationKey] !== activationOwner) {
+				subagentChild = true;
+			} else {
+				activations[activationKey] = activationOwner;
+			}
+		}
+		// Pi's branch and SDK launch model belong to THIS session. Shared account
+		// telemetry (or another pane's legacy preference) cannot override them.
+		startupModel = ctx?.model;
+		if (hostOwnsSessionModel && !subagentChild) {
+			const changes = ctx.sessionManager.getBranch().filter((entry: any) => entry.type === "model_change");
+			const last = changes.at(-1);
+			if (last?.provider && last?.modelId) startupModel = { provider: last.provider, id: last.modelId };
+			if (!explicitCli.thinking && config.reasoningLevel === "auto") desiredThinkingLevel = readThinkingLevel();
+		}
+		completionRouterContext = subagentChild ? undefined : ctx;
 		manualRouteOwnsErrors = false;
 		lastObservedModelKey = thinkingModelKey(ctx);
 		lastObservedThinkingLevel = readThinkingLevel();
@@ -10966,6 +11005,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// Kill every timer and drop the pending continuation so nothing survives the session.
 	safeOn("session_shutdown", async (_event, ctx) => {
 		chainEpoch++;
+		if (activations[activationKey] === activationOwner) delete activations[activationKey];
 		sessionClosed = true;
 		completionRouterContext = undefined;
 		modelCatalogContext = undefined;
@@ -11343,6 +11383,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if ((event as any).source === "restore") return;
+		if (config.reasoningLevel === "auto" && !explicitCli.thinking && appliedThinkingLevel) {
+			desiredThinkingLevel = appliedThinkingLevel;
+			thinkingClamp = undefined;
+		}
 		modelPreferenceChanged = true;
 		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
