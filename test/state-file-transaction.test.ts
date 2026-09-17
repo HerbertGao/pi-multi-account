@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +18,25 @@ test("shared state preserves other sessions' cooldowns and deliberate local clea
     { usageByProvider: { a: { credentialHash: "same", fetchedAt: 3 } } }).usageByProvider.a.fetchedAt, 3);
 });
 
+test("busy state lock fails boundedly without mutation and permits a later retry", () => {
+  const dir = mkdtempSync(join(tmpdir(), "multi-state-busy-")), path = join(dir, "state.json");
+  const lockfile = createRequire(import.meta.url)("proper-lockfile");
+  mutateStateFile(path, () => ({ existing: true }));
+  const release = lockfile.lockSync(path, { realpath: false });
+  let transforms = 0;
+  try {
+    const start = Date.now();
+    assert.throws(() => mutateStateFile(path, () => { transforms++; return {}; }), { code: "ELOCKED" });
+    assert.ok(Date.now() - start < 5000, "busy storage cannot block the host indefinitely");
+    assert.equal(transforms, 0, "never read/transform outside the lock");
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { existing: true });
+  } finally { release(); }
+  try {
+    mutateStateFile(path, disk => ({ ...disk, retried: true }));
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { existing: true, retried: true });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("four real processes retain every independent state update without torn JSON", async () => {
   const dir = mkdtempSync(join(tmpdir(), "multi-state-")), path = join(dir, "state.json");
   const module = new URL("../state-file-transaction.ts", import.meta.url).href;
@@ -25,8 +45,23 @@ test("four real processes retain every independent state update without torn JSO
     await Promise.all(Array.from({ length: 4 }, (_, worker) => new Promise<void>((resolve, reject) => {
       const child = spawn(process.execPath, ["--input-type=module", "-e", `
         import { mutateStateFile, mergeStateDeltas } from ${JSON.stringify(module)};
-        for(let i=0;i<30;i++) mutateStateFile(${JSON.stringify(path)}, disk =>
-          mergeStateDeltas({}, { exhaustedUntilByProvider: { [${worker} + ':' + i]: i + 1 } }, disk));
+        import { setTimeout as sleep } from 'node:timers/promises';
+        // Production deliberately yields with ELOCKED after 250ms rather than blocking
+        // Pi indefinitely. A saturated Linux runner may hit that contract; retry the
+        // same independent delta at an async boundary, never weaken the lock bound.
+        for(let i=0;i<30;i++) {
+          const deadline = Date.now() + 10_000;
+          while (true) {
+            try {
+              mutateStateFile(${JSON.stringify(path)}, disk =>
+                mergeStateDeltas({}, { exhaustedUntilByProvider: { [${worker} + ':' + i]: i + 1 } }, disk));
+              break;
+            } catch (error) {
+              if (error.code !== 'ELOCKED' || Date.now() >= deadline) throw error;
+              await sleep(10);
+            }
+          }
+        }
       `], { stdio: ["ignore", "ignore", "pipe"] });
       let error = ""; child.stderr.on("data", chunk => error += chunk);
       child.on("error", reject); child.on("close", code => code === 0 ? resolve() : reject(new Error(error)));

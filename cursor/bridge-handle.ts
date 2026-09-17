@@ -39,6 +39,7 @@ export interface BridgeHandle {
   readonly alive: boolean;
   write(data: Uint8Array): void;
   end(): void;
+  destroy(): void;
   onData(cb: (chunk: Buffer) => void): void;
   onClose(cb: (code: number) => void): void;
 }
@@ -103,6 +104,19 @@ export function createBridgeHandle(
     return !stdin.writableEnded && !stdin.destroyed;
   };
 
+  const end = (): void => {
+    if (ended) return;
+    if (writable()) {
+      try {
+        proc.stdin!.write(lpEncode(new Uint8Array(0)));
+        proc.stdin!.end();
+      } catch (error) {
+        debug("bridge.end_failed", { error: String(error) });
+      }
+    }
+    ended = true;
+  };
+
   return {
     proc,
     // Ended counts as dead: a caller that asks `alive` is deciding whether to keep talking on
@@ -119,17 +133,15 @@ export function createBridgeHandle(
         debug("bridge.write_failed", { error: String(error) });
       }
     },
-    end() {
-      if (ended) return;
-      if (writable()) {
-        try {
-          proc.stdin!.write(lpEncode(new Uint8Array(0)));
-          proc.stdin!.end();
-        } catch (error) {
-          debug("bridge.end_failed", { error: String(error) });
-        }
+    end,
+    destroy() {
+      end();
+      if (exited) return;
+      try {
+        proc.kill();
+      } catch (error) {
+        debug("bridge.kill_failed", { error: String(error) });
       }
-      ended = true;
     },
     onData(cb: (chunk: Buffer) => void) { cbs.data = cb; },
     onClose(cb: (code: number) => void) {

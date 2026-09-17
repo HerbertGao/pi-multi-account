@@ -18,10 +18,12 @@ import {
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { VERSION as PI_HOST_VERSION } from "@earendil-works/pi-coding-agent";
 import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
+import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
+import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
@@ -268,6 +270,13 @@ function legacyCodexAccessToken(
 	return `eyJhbGciOiJub25lIn0.${payload}.${tokenVersion}`;
 }
 
+function xaiAccessToken(userId: string, tokenVersion = "1"): string {
+	const payload = Buffer.from(
+		JSON.stringify({ sub: userId, principal_id: userId }),
+	).toString("base64url");
+	return `eyJhbGciOiJub25lIn0.${payload}.${tokenVersion}`;
+}
+
 const TWO_ACCOUNTS: Account = {
 	anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
 	"openai-codex-account-2": {
@@ -420,6 +429,10 @@ function setup(opts: {
 		thinkingLevels: [] as string[],
 		registrations: [] as Array<{ provider: string; models: number | undefined }>,
 		catalogSnapshots: [] as any[],
+		completionRouters: [] as Array<{
+			select: (request: any) => any;
+			onAttempt?: (attempt: any) => any;
+		}>,
 		aborts: 0,
 		authReloads: 0,
 	};
@@ -620,6 +633,12 @@ function setup(opts: {
 		) => {
 			commands[name] = options.handler;
 		},
+		registerCompletionRouter: (router: {
+			select: (request: any) => any;
+			onAttempt?: (attempt: any) => any;
+		}) => {
+			rec.completionRouters.push(router);
+		},
 		on: (event: string, handler: any) => {
 			(events[event] ??= []).push(handler);
 		},
@@ -795,6 +814,7 @@ function setup(opts: {
 		userSetsThinking,
 		settleThinkingLevelSelects,
 		providerConfigs,
+		completionRouter: () => rec.completionRouters.at(-1),
 		hasHandler: (event: string) => (events[event]?.length ?? 0) > 0,
 	};
 }
@@ -827,6 +847,246 @@ async function finishError(
 	await t.fire("agent_end", { messages: [message] });
 	return message;
 }
+
+function completionRequest(
+	operationId: string,
+	attempt: number,
+	sessionModel: { provider: string; id: string },
+	attempts: any[] = [],
+) {
+	return {
+		operationId,
+		purpose: "memory/review",
+		attempt,
+		maxAttempts: 4,
+		deadlineAt: Date.now() + 10_000,
+		sessionModel,
+		preferredModels: [],
+		attempts,
+		previous: attempts.at(-1),
+	};
+}
+
+function completionAttempt(
+	operationId: string,
+	attempt: number,
+	model: { provider: string; id: string },
+	options: {
+		status?: number;
+		stopReason?: string;
+		errorMessage?: string;
+		dispatched?: boolean;
+	} = {},
+) {
+	return {
+		operationId,
+		purpose: "memory/review",
+		attempt,
+		model,
+		dispatched: options.dispatched ?? true,
+		stopReason: options.stopReason ?? "error",
+		errorMessage: options.errorMessage,
+		response: options.status === undefined ? undefined : { status: options.status },
+	};
+}
+
+test("background completion quota fallback shares health without changing the foreground model", async () => {
+	const current = { provider: "anthropic", id: "claude-opus-4-8" };
+	const t = setup({ current, config: { childProxy: false } });
+	await t.fire("session_start");
+	const router = t.completionRouter();
+	assert.ok(router, "host completion router must be registered");
+
+	const firstDecision = await router.select(completionRequest("quota-op", 1, current));
+	assert.deepEqual(firstDecision, { action: "route", model: current });
+	const refused = completionAttempt("quota-op", 1, current, {
+		status: 429,
+		errorMessage: "429 quota exhausted",
+	});
+	await router.onAttempt?.(refused);
+	const secondDecision = await router.select(completionRequest("quota-op", 2, current, [refused]));
+
+	assert.equal(secondDecision.action, "route");
+	assert.notEqual(secondDecision.model.provider, current.provider);
+	assert.deepEqual(t.ctx.model, current, "background routing must not mutate ctx.model");
+	assert.deepEqual(t.rec.setModels, [], "background routing must never call pi.setModel");
+	assert.ok(
+		(t.readState().exhaustedUntilByProvider?.anthropic ?? 0) > Date.now(),
+		"the provider refusal must update shared cooldown state",
+	);
+});
+
+test("later background completion follows a foreground switch after a local fallback", async () => {
+	const current = { provider: "anthropic", id: "claude-opus-4-8" };
+	const switched = { provider: "openai-codex-account-2", id: "claude-opus-4-8" };
+	const t = setup({ current, config: { childProxy: false } });
+	await t.fire("session_start");
+	const router = t.completionRouter();
+	assert.ok(router);
+
+	const refused = completionAttempt("quota-op", 1, current, {
+		status: 429,
+		errorMessage: "429 quota exhausted",
+	});
+	await router.onAttempt?.(refused);
+	const fallback = await router.select(completionRequest("quota-op", 2, current, [refused]));
+	assert.equal(fallback.action, "route");
+	assert.notEqual(fallback.model.provider, current.provider);
+	assert.deepEqual(t.ctx.model, current);
+	assert.deepEqual(t.rec.setModels, []);
+
+	await t.setModel(switched.provider, switched.id);
+	assert.deepEqual(t.ctx.model, switched);
+
+	const later = await router.select(completionRequest("later-op", 1, switched));
+	assert.equal(later.action, "route");
+	assert.equal(later.model.provider, switched.provider);
+	assert.notEqual(later.model.provider, current.provider);
+	assert.deepEqual(t.ctx.model, switched, "the later background route must not mutate the switched foreground model");
+	assert.deepEqual(t.rec.setModels, [`${switched.provider}/${switched.id}`]);
+});
+
+test("fresh OS process repeats background 429 then later foreground switch", async (t) => {
+	if (process.env.PI_COMPLETION_FRESH_CHILD === "1") {
+		t.skip("this case is the parent spawner, not the child suite");
+		return;
+	}
+	const child = spawn(
+		process.execPath,
+		[
+			"--test",
+			"--test-reporter",
+			"spec",
+			"--test-name-pattern",
+			"later background completion follows a foreground switch after a local fallback",
+			fileURLToPath(import.meta.url),
+		],
+		{
+			cwd: join(dirname(fileURLToPath(import.meta.url)), ".."),
+			env: Object.fromEntries(
+				Object.entries({ ...process.env, PI_COMPLETION_FRESH_CHILD: "1" }).filter(
+					([key]) => key !== "NODE_TEST_CONTEXT",
+				),
+			),
+			stdio: ["ignore", "pipe", "pipe"],
+		},
+	);
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => {
+		stdout += String(chunk);
+	});
+	child.stderr.on("data", (chunk) => {
+		stderr += String(chunk);
+	});
+	const code = await new Promise<number | null>((resolve, reject) => {
+		child.on("error", reject);
+		child.on("close", resolve);
+	});
+	const output = `${stdout}\n${stderr}`;
+	assert.equal(code, 0, `fresh-process fixture failed:\n${output}`);
+	assert.match(output, /later background completion follows a foreground switch after a local fallback/);
+	assert.match(output, /# pass 1|# tests 1|pass 1/);
+});
+
+test("background transient retry is same-route once, then falls back instead of looping", async () => {
+	const current = { provider: "anthropic", id: "claude-opus-4-8" };
+	const t = setup({ current, config: { childProxy: false, transientCooldownMs: 2_000 } });
+	await t.fire("session_start");
+	const router = t.completionRouter();
+	assert.ok(router);
+
+	const first = completionAttempt("transient-op", 1, current, {
+		status: 500,
+		errorMessage: "500 internal server error",
+	});
+	await router.onAttempt?.(first);
+	const retry = await router.select(completionRequest("transient-op", 2, current, [first]));
+	assert.deepEqual(retry, { action: "route", model: current, delayMs: 1_000 });
+
+	const second = completionAttempt("transient-op", 2, current, {
+		status: 500,
+		errorMessage: "500 internal server error",
+	});
+	await router.onAttempt?.(second);
+	const fallback = await router.select(completionRequest("transient-op", 3, current, [first, second]));
+	assert.equal(fallback.action, "route");
+	assert.notEqual(fallback.model.provider, current.provider);
+	assert.deepEqual(t.ctx.model, current);
+	assert.deepEqual(t.rec.setModels, []);
+});
+
+test("a background cooldown is visible to a concurrent operation", async () => {
+	const current = { provider: "anthropic", id: "claude-opus-4-8" };
+	const t = setup({ current, config: { childProxy: false } });
+	await t.fire("session_start");
+	const router = t.completionRouter();
+	assert.ok(router);
+	const refused = completionAttempt("first-op", 1, current, {
+		status: 429,
+		errorMessage: "429 quota exhausted",
+	});
+	await router.onAttempt?.(refused);
+
+	const otherOperation = await router.select(completionRequest("second-op", 1, current));
+	assert.equal(otherOperation.action, "route");
+	assert.notEqual(otherOperation.model.provider, current.provider);
+	assert.deepEqual(t.ctx.model, current);
+});
+
+test("non-provider background failures stop without poisoning route health", async () => {
+	const current = { provider: "anthropic", id: "claude-opus-4-8" };
+	const t = setup({ current, config: { childProxy: false } });
+	await t.fire("session_start");
+	const router = t.completionRouter();
+	assert.ok(router);
+	const malformedConsumerOutcome = completionAttempt("consumer-op", 1, current, {
+		errorMessage: "memory schema parse_error: malformed operations",
+	});
+	await router.onAttempt?.(malformedConsumerOutcome);
+	const decision = await router.select(completionRequest("consumer-op", 2, current, [malformedConsumerOutcome]));
+
+	assert.deepEqual(decision, {
+		action: "stop",
+		reason: "Completion failure is not provider-route evidence (unhandled)",
+	});
+	assert.equal(t.readState().exhaustedUntilByProvider?.anthropic, undefined);
+	assert.deepEqual(t.ctx.model, current);
+});
+
+test("Cursor background payloads use the host side-channel session identity", async () => {
+	const current = { provider: "cursor", id: "composer-2.5" };
+	const t = setup({
+		accounts: {
+			cursor: {
+				type: "oauth",
+				access: "cursor-access",
+				refresh: "cursor-refresh",
+				expires: Date.now() + 60_000,
+			},
+		},
+		current,
+		config: { childProxy: false },
+	});
+	const sideChannelSessionId = "foreground-session:completion:operation-1";
+
+	const shaped = await t.fire("before_provider_request", {
+		payload: { model: current.id },
+		request: {
+			operationId: "operation-1",
+			kind: "background",
+			purpose: "hermes-memory/auto-review",
+			attempt: 1,
+			sessionId: sideChannelSessionId,
+			model: current,
+		},
+	});
+
+	assert.equal(shaped.pi_session_id, sideChannelSessionId);
+	assert.notEqual(shaped.pi_session_id, t.ctx.sessionManager?.getSessionId?.());
+	assert.deepEqual(t.ctx.model, current);
+	assert.deepEqual(t.rec.setModels, []);
+});
 
 // ---------------------------------------------------------------------------
 // Usage footer
@@ -988,6 +1248,165 @@ test(
 				!state.exhaustedUntilByProvider?.["openai-codex-account-2"] &&
 					!state.exhaustedUntilByProvider?.["openai-codex-account-3"],
 				"fresh headroom after a plan change must clear both stale cooldowns",
+			);
+		} finally {
+			await t.fire("session_shutdown");
+			globalThis.fetch = originalFetch;
+		}
+	},
+);
+
+test(
+	"startup refreshes active xAI usage and survives a concurrent OAuth rotation",
+	{ concurrency: false },
+	async () => {
+		const now = Date.now();
+		const staleAccess = xaiAccessToken("xai-user-123", "stale");
+		const winnerAccess = xaiAccessToken("xai-user-123", "race-winner");
+		const freshAccess = xaiAccessToken("xai-user-123", "fresh");
+		let billingRequests = 0;
+		let refreshRequests = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url === XAI_SUBSCRIPTION_USAGE_URL) {
+				billingRequests++;
+				const headers = new Headers(init?.headers);
+				assert.equal(headers.get("x-userid"), "xai-user-123");
+				if (billingRequests === 1) return new Response("{}", { status: 401 });
+				assert.equal(headers.get("Authorization"), `Bearer ${freshAccess}`);
+				return new Response(
+					JSON.stringify({
+						config: {
+							creditUsagePercent: 25,
+							currentPeriod: {
+								start: new Date(now - 86_400_000).toISOString(),
+								end: new Date(now + 6 * 86_400_000).toISOString(),
+							},
+						},
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			if (url === "https://auth.x.ai/oauth2/token") {
+				refreshRequests++;
+				assert.equal(init?.method, "POST");
+				const body = String(init?.body);
+				assert.match(body, /grant_type=refresh_token/);
+				if (refreshRequests === 1) {
+					assert.match(body, /refresh_token=xai-refresh/);
+					writeFileSync(
+						AUTH,
+						JSON.stringify({
+							xai: {
+								type: "oauth",
+								access: winnerAccess,
+								refresh: "winner-refresh",
+							},
+						}),
+					);
+					return new Response(
+						JSON.stringify({ error: "invalid_grant" }),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				}
+				assert.match(body, /refresh_token=winner-refresh/);
+				return new Response(
+					JSON.stringify({
+						access_token: freshAccess,
+						refresh_token: "rotated-xai-refresh",
+						expires_in: 3_600,
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			throw new Error(`unexpected request: ${url}`);
+		}) as typeof fetch;
+
+		const t = setup({
+			accounts: {
+				xai: {
+					type: "oauth",
+					access: staleAccess,
+					refresh: "xai-refresh",
+				},
+			},
+			current: { provider: "xai", id: "grok-4.6" },
+			config: { showUsage: true },
+			hostAuthStorage: "pi-0.84",
+		});
+
+		try {
+			await t.fire("session_start");
+			assert.equal(billingRequests, 2, "the 401 must be retried with fresh OAuth");
+			assert.equal(
+				refreshRequests,
+				2,
+				"invalid_grant must retry with the refresh token another session stored",
+			);
+			const stored = JSON.parse(readFileSync(AUTH, "utf8")).xai;
+			assert.equal(stored.access, freshAccess);
+			assert.equal(stored.refresh, "rotated-xai-refresh");
+			assert.ok(
+				t.rec.statuses.some(
+					({ value }) =>
+						typeof value === "string" &&
+						value.includes("xAI") &&
+						value.includes("75% left"),
+				),
+				`startup must populate the xAI footer; statuses=${JSON.stringify(t.rec.statuses)}`,
+			);
+		} finally {
+			await t.fire("session_shutdown");
+			globalThis.fetch = originalFetch;
+		}
+	},
+);
+
+test(
+	"xAI limits can be requested while the footer is disabled",
+	{ concurrency: false },
+	async () => {
+		const now = Date.now();
+		let billingRequests = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			assert.equal(String(input), XAI_SUBSCRIPTION_USAGE_URL);
+			billingRequests++;
+			return new Response(
+				JSON.stringify({
+					config: {
+						creditUsagePercent: 25,
+						currentPeriod: {
+							start: new Date(now - 86_400_000).toISOString(),
+							end: new Date(now + 6 * 86_400_000).toISOString(),
+						},
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+		const t = setup({
+			accounts: {
+				xai: {
+					type: "oauth",
+					access: xaiAccessToken("xai-user-123"),
+					refresh: "xai-refresh",
+				},
+			},
+			current: { provider: "xai", id: "grok-4.6" },
+			config: { showUsage: false },
+		});
+
+		try {
+			await t.fire("session_start");
+			await t.command("limits");
+			assert.equal(billingRequests, 1);
+			assert.ok(
+				t.rec.notifies.some(
+					(message) => message.includes("Limits for xAI") && message.includes("75% left"),
+				),
+				`limits must work independently of the footer; notifies=${t.rec.notifies.join(" | ")}`,
 			);
 		} finally {
 			await t.fire("session_shutdown");
@@ -3129,6 +3548,62 @@ test("a Kimi subscription slot is registered so /login can offer it", async () =
 	);
 });
 
+test("native session model ignores shared preferences on startup, prompts and shutdown", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "low",
+		seedState: { lastUserModel: { provider: "openai-codex", id: "gpt-5.6-sol" }, lastUserThinkingLevel: "max" },
+	});
+	t.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await t.fire("session_start");
+		await t.fire("agent_start");
+		assert.equal(t.ctx.model.provider, "anthropic");
+		assert.equal(t.thinkingLevel(), "low", "another pane cannot supply thinking intent");
+		await t.fire("input", { text: "continue", source: "interactive" });
+		assert.equal(t.ctx.model.provider, "anthropic");
+		assert.deepEqual(t.rec.setModels, []);
+	} finally { await t.fire("session_shutdown"); }
+	assert.equal(JSON.parse(readFileSync(STATE, "utf8")).lastUserModel.provider, "openai-codex",
+		"session shutdown must not publish a pane's live model as a shared default");
+});
+
+test("in-process child activations are passive and root reload reacquires ownership", async () => {
+	const root = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	root.ctx.sessionManager = { getBranch: () => [] };
+	await root.fire("session_start");
+	const child = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	child.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await child.fire("session_start");
+		assert.equal(child.ctx.model.provider, "openai-codex");
+		await finishError(child, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.deepEqual(child.rec.setModels, [], "parent runner alone owns child fallback");
+		assert.equal(child.rec.continueCalls.length, 0);
+	} finally { await child.fire("session_shutdown"); await root.fire("session_shutdown"); }
+	const reloaded = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	reloaded.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await reloaded.fire("session_start", { reason: "reload" });
+		await finishError(reloaded, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+		assert.ok(reloaded.rec.setModels.length > 0, "reload cannot permanently disable root failover");
+	} finally { await reloaded.fire("session_shutdown"); }
+});
+
+test("manual model selection adopts host per-model thinking defaults in auto mode", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "low" });
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	t.ctx.model = { provider: "openai-codex", id: "gpt-5.6-sol" };
+	t.userSetsThinking("high");
+	await t.fire("thinking_level_select", { level: "high", previousLevel: "low" });
+	await t.fire("model_select", { model: t.ctx.model, source: "set" });
+	await t.fire("agent_start");
+	assert.equal(t.thinkingLevel(), "high");
+	await t.fire("session_shutdown");
+});
+
 test("session_start restores lastUserModel after Pi falls back to anthropic/claude-opus-4-8", async () => {
 	installCursorProvider();
 	const t = setup({
@@ -4385,11 +4860,9 @@ test("a successful Pi-native retry cancels the extension's same-route wake", asy
 	assert.equal(t.rec.sent.length, 0, "no synthetic retry prompt may follow success");
 });
 
-test("a second consecutive transient error escapes the failing route instead of starting another same-route wave", async () => {
-	// Pi has its own agent-level retry loop (`retry.maxRetries`, default 3). The first Kimi 500
-	// may therefore be retried in-place by Pi, but when that retry also returns 500 the extension
-	// must use the remaining native retry/continuation on another healthy route. The v1.21.2
-	// behaviour armed another same-Kimi wake here, multiplying Pi's retries by extension retries.
+test("a second consecutive transient error keeps the route and a native success cancels its wake", async () => {
+	// Owner correction 2026-09-16: even repeated 500s are not quota evidence.
+	// Native retries count toward the bound, but must never authorize route switching.
 	const t = setup({
 		accounts: {
 			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
@@ -4411,23 +4884,11 @@ test("a second consecutive transient error escapes the failing route instead of 
 	const second = assistantError("kimi-coding", "k3", "500 server_error");
 	await t.fire("message_end", { message: second });
 
-	assert.equal(
-		t.rec.setModels[0],
-		"kimi-coding-account-2/k3",
-		`the repeated 500 must escape to the same-model sibling first; got ${t.rec.setModels.join(", ")}`,
-	);
-	assert.equal(
-		t.readState().pendingFrom,
-		"kimi-coding-account-2/k3",
-		"the fallback may own a bounded wake, but the stale failed-Kimi wake must be gone",
-	);
-	assert.ok(
-		!t.rec.setModels.some((model) => model.startsWith("anthropic/")),
-		`same-model Kimi capacity outranks another frontier family; got ${t.rec.setModels.join(", ")}`,
-	);
+	assert.deepEqual(t.rec.setModels, [], "neither a sibling nor another provider may be selected");
+	assert.equal(t.readState().pendingFrom, "kimi-coding/k3");
+	assert.equal(t.readState().exhaustedUntilByProvider?.["kimi-coding"], undefined);
 
-	// If Pi still has a native retry in its own budget, it now runs on the fallback. Success must
-	// win the race against our fallback-owned wake and retire it without another synthetic prompt.
+	// Success must win the race against our same-route wake without a duplicate prompt.
 	await t.fire("after_provider_response", { status: 200, headers: {} });
 	assert.equal(t.readState().pendingFrom, undefined);
 	await wait(1100);
@@ -4435,7 +4896,226 @@ test("a second consecutive transient error escapes the failing route instead of 
 	assert.equal(t.rec.sent.length, 0);
 });
 
-test("transient escalation still resumes on the fallback when Pi has no native retry left", async () => {
+test("temporary failures preserve the selected provider and do not poison quota health", async () => {
+	installCursorProvider();
+	try {
+		for (const error of [
+			"Provider finish_reason: error\nCursor Run stalled: no useful output for 5m; stream timed out",
+			"503 server overloaded",
+		]) {
+			const t = setup({
+				accounts: {
+					cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				},
+				current: { provider: "cursor", id: "cursor-grok-4.6" },
+				config: { includeCursor: true, transientCooldownMs: 25, pendingPollMs: 25 },
+				omitContinueAgent: true,
+			});
+			await t.fire("session_start");
+			await finishError(t, "cursor", "cursor-grok-4.6", error);
+			assert.deepEqual(t.rec.setModels, [], "temporary failure is not permission to switch");
+			assert.equal(t.readState().exhaustedUntilByProvider?.cursor, undefined);
+			assert.equal(t.readState().pendingFrom, "cursor/cursor-grok-4.6");
+			await wait(1100);
+			assert.equal(t.rec.sent.length, 1, "the same route must actually resume");
+			await t.fire("before_agent_start", {});
+			assert.deepEqual(t.rec.setModels, [], "preflight must not undo same-route recovery");
+			await finishError(t, "cursor", "cursor-grok-4.6", error);
+			assert.deepEqual(t.rec.setModels, [], "repetition still is not quota evidence");
+			assert.equal(t.readState().exhaustedUntilByProvider?.cursor, undefined);
+			await t.fire("session_shutdown");
+		}
+	} finally {
+		uninstallCursorProvider();
+	}
+});
+
+test("a Cursor transport stall retries the exact route even with healthy alternatives", async () => {
+	installCursorProvider();
+	try {
+		const t = setup({
+			accounts: {
+				cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+				"cursor-account-2": { type: "oauth", access: "c2", refresh: "cr2" },
+				anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			},
+			current: { provider: "cursor", id: "cursor-grok-4.6" },
+			config: { includeCursor: true, providerOrder: ["cursor", "anthropic"], transientCooldownMs: 1 },
+		});
+		await t.fire("session_start");
+		await t.fire("agent_start");
+		const stall = () => assistantError(
+			"cursor",
+			"cursor-grok-4.6",
+			"Provider finish_reason: error\nCursor produced no output for 1m; stream timed out",
+		);
+
+		await t.fire("message_end", { message: stall() });
+		assert.deepEqual(t.rec.setModels, [], "a dead Run is not a dead account");
+		assert.equal(t.readState().pendingFrom, "cursor/cursor-grok-4.6");
+		assert.equal(t.readState().exhaustedUntilByProvider?.cursor, undefined);
+		assert.equal(
+			t.readState().exhaustedUntilByProvider?.["cursor-account-2"],
+			undefined,
+			"the healthy sibling is neither selected nor cooled",
+		);
+
+		// HTTP 200 retires a duplicate wake but is not a completed response.
+		await t.fire("after_provider_response", { status: 200, headers: {} });
+		assert.equal(t.readState().pendingFrom, undefined);
+
+		await t.fire("message_end", { message: stall() });
+		assert.deepEqual(t.rec.setModels, [], "a second stall cannot authorize fallback either");
+		assert.equal(t.readState().pendingFrom, "cursor/cursor-grok-4.6");
+	} finally {
+		uninstallCursorProvider();
+	}
+});
+
+test("a lone stalled Cursor route stops after bounded retries without quota cooldown", async () => {
+	installCursorProvider();
+	try {
+		const t = setup({
+			accounts: {
+				cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+			},
+			current: { provider: "cursor", id: "cursor-grok-4.6" },
+			config: { includeCursor: true, providerOrder: ["cursor"], transientCooldownMs: 1 },
+		});
+		await t.fire("session_start");
+		await t.fire("agent_start");
+
+		for (let attempt = 1; attempt <= 4; attempt++) {
+			await t.fire("message_end", {
+				message: assistantError(
+					"cursor", "cursor-grok-4.6",
+					"Provider finish_reason: error\nCursor Run stalled: no useful output for 5m; stream timed out",
+				),
+			});
+			assert.equal(t.readState().pendingFrom, attempt < 4 ? "cursor/cursor-grok-4.6" : undefined);
+		}
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.readState().exhaustedUntilByProvider?.cursor, undefined);
+		assert.ok(t.rec.notifies.some((message) => /stopped after 4 failed attempts.*NOT changed/.test(message)));
+		await wait(1100);
+		assert.equal(t.rec.continueCalls.length, 0, "the stopped wake cannot revive itself");
+	} finally {
+		uninstallCursorProvider();
+	}
+});
+
+test("a Cursor stall wake resumes Cursor despite alternative same-model capacity", async () => {
+	installCursorProvider();
+	try {
+		const t = setup({
+			accounts: {
+				cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+				"openai-codex-account-2": {
+					type: "oauth",
+					access: "o2",
+					refresh: "or2",
+					accountId: "codex-2",
+				},
+			},
+			current: { provider: "cursor", id: "cursor-grok-4.6" },
+			config: {
+				includeCursor: true,
+				providerOrder: ["cursor", "openai-codex"],
+				preferredModels: { "openai-codex": ["cursor-grok-4.6"] },
+				transientCooldownMs: 1,
+				pendingPollMs: 25,
+			},
+			hostModelsByProvider: {
+				"openai-codex-account-2": ["cursor-grok-4.6"],
+			},
+			seedState: {
+				stateVersion: 5,
+				exhaustedUntilByProvider: {},
+				exhaustedUntilByModel: {},
+				lastProbeAtByProvider: {},
+				invalidatedByProvider: {},
+				lastSwitches: [],
+				usageByProvider: {
+					cursor: {
+						provider: "cursor",
+						family: "cursor",
+						fetchedAt: Date.now(),
+						serviceable: true,
+						primary: { usedPercent: 2, resetAt: Date.now() + 60_000 },
+					},
+				},
+			},
+			omitContinueAgent: true,
+		});
+		await t.fire("session_start");
+		await t.fire("agent_start");
+
+		await t.fire("message_end", {
+			message: assistantError(
+				"cursor",
+				"cursor-grok-4.6",
+				"Provider finish_reason: error\nCursor Run stalled: no upstream frames for 1m; stream timed out",
+			),
+		});
+		assert.deepEqual(t.rec.setModels, []);
+
+		await wait(1100);
+		assert.deepEqual(t.rec.setModels, [], "the wake must preserve the selected route");
+		assert.equal(t.rec.sent.length, 1, "Cursor must continue the interrupted task");
+		assert.match(String(t.rec.sent[0].prompt), /retrying cursor\/cursor-grok-4.6/);
+	} finally {
+		uninstallCursorProvider();
+	}
+});
+
+test("Cursor stall evidence survives tool-use progress until the task actually finishes", async () => {
+	installCursorProvider();
+	try {
+		const t = setup({
+			accounts: {
+				cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+				"cursor-account-2": { type: "oauth", access: "c2", refresh: "cr2" },
+				anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			},
+			current: { provider: "cursor", id: "cursor-grok-4.6" },
+			config: { includeCursor: true, providerOrder: ["cursor", "anthropic"], transientCooldownMs: 1 },
+		});
+		await t.fire("session_start");
+		await t.fire("agent_start");
+		const stall = (provider: string) => assistantError(
+			provider,
+			"cursor-grok-4.6",
+			"Provider finish_reason: error\nCursor Run stalled: no upstream frames for 1m; stream timed out",
+		);
+
+		await t.fire("message_end", { message: stall("cursor") });
+		assert.deepEqual(t.rec.setModels, []);
+		await t.fire("after_provider_response", { status: 200, headers: {} });
+
+		await t.fire("message_end", {
+			message: {
+				role: "assistant",
+				provider: "cursor",
+				model: "cursor-grok-4.6",
+				stopReason: "toolUse",
+				timestamp: messageTimestamp++,
+				content: [{ type: "toolCall", id: "cursor-progress", name: "read", arguments: { path: "README.md" } }],
+			},
+		});
+
+		// Tool progress cannot erase the task's bounded stall history.
+		for (let attempt = 2; attempt <= 4; attempt++) {
+			await t.fire("message_end", { message: stall("cursor") });
+		}
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.readState().pendingFrom, undefined, "four stalls stop even across successful tools");
+	} finally {
+		uninstallCursorProvider();
+	}
+});
+
+test("repeated transient errors still resume the same route when Pi has no native retry left", async () => {
 	const t = setup({
 		accounts: {
 			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
@@ -4453,16 +5133,12 @@ test("transient escalation still resumes on the fallback when Pi has no native r
 	assert.equal(t.rec.sent.length, 1, "the first failure gets its one same-route retry");
 	await t.fire("before_agent_start", {});
 	await finishError(t, "kimi-coding", "k3", "500 server_error");
-	assert.equal(t.rec.setModels[0], "kimi-coding-account-2/k3");
-	assert.equal(t.readState().pendingFrom, "kimi-coding-account-2/k3");
+	assert.deepEqual(t.rec.setModels, []);
+	assert.equal(t.readState().pendingFrom, "kimi-coding/k3");
 
 	await wait(1100);
-	assert.equal(
-		t.rec.sent.length,
-		2,
-		"if Pi does not retry natively, the fallback wake must continue the interrupted task",
-	);
-	assert.match(String(t.rec.sent[1].prompt), /kimi-coding-account-2\/k3/);
+	assert.equal(t.rec.sent.length, 2, "without native retry, the same-route wake must continue");
+	assert.match(String(t.rec.sent[1].prompt), /retrying kimi-coding\/k3/);
 });
 
 test("hyphenated Invalid API-key immediately invalidates Alibaba and fails over", async () => {
@@ -5274,6 +5950,88 @@ test("session_before_compact: returns the summary from a live account", async ()
 		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
 		"summary is generated on the live anthropic account",
 	);
+});
+
+test("session_before_compact: a healthy Cursor account still routes the summary off Cursor", async () => {
+	installCursorProvider();
+	const asked: string[] = [];
+	const t = setup({
+		accounts: {
+			cursor: { type: "oauth", access: "c-tok", refresh: "c-ref" },
+			"cursor-account-2": { type: "oauth", access: "c2", refresh: "cr2" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "cursor", id: "cursor-grok-4.6" },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		config: { includeCursor: true },
+		compactFn: async (_preparation, model) => {
+			asked.push((model as { provider: string }).provider);
+			return COMPACTION_SUMMARY;
+		},
+	});
+	await t.fire("session_start");
+	const result = await t.fire("session_before_compact", {
+		reason: "threshold",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
+	assert.ok(asked.length > 0, "a live non-Cursor account must produce the summary");
+	assert.ok(
+		!asked.some((provider) => provider === "cursor" || provider.startsWith("cursor-account-")),
+		`Cursor must not summarize; asked ${asked.join(", ")}`,
+	);
+	assert.ok(
+		!t.rec.compactionAuthFor.some((model) => model.startsWith("cursor")),
+		`must not even ask Cursor for compaction auth; got ${t.rec.compactionAuthFor.join(", ")}`,
+	);
+	uninstallCursorProvider();
+});
+
+test("session_before_compact: Cursor-only session cancels instead of summarizing on Cursor", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			cursor: { type: "oauth", access: "c-tok", refresh: "c-ref" },
+		},
+		current: { provider: "cursor", id: "cursor-grok-4.6" },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		config: { includeCursor: true },
+		compactFn: async () => {
+			throw new Error("must not compact on Cursor");
+		},
+	});
+	await t.fire("session_start");
+	const result = await t.fire("session_before_compact", {
+		reason: "threshold",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(
+		result?.cancel,
+		true,
+		"no non-Cursor account → cancel; Pi native on Cursor is the hang",
+	);
+	assert.equal(
+		t.rec.compactionAuthFor.length,
+		0,
+		"Cursor must not be asked to summarize",
+	);
+	uninstallCursorProvider();
 });
 
 test("session_before_compact: a timed-out live summary is aborted and cancelled — never handed to the spent account", async () => {
@@ -7115,6 +7873,39 @@ test("max survives a switch through a weaker model, exactly like every other lev
 	);
 });
 
+test("a startup model switch must not adopt the host's clamped level as the user's intent", async () => {
+	// Real incident, 2026-09-11: the session came up on a provider whose map hides levels, the
+	// host applied its own default shortly after the switch, and the session was left at `low`
+	// while the state file still recorded that the user had chosen `max`. The extension adopted
+	// the host value as the new intent on the FIRST turn (where there was no intent yet to
+	// compare against) and never restored `max` — the user found it 58 minutes later.
+	const t = setup({
+		accounts: THINKING_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		// By the time the first turn starts, the host has already clamped the level.
+		thinkingLevel: "low",
+		seedState: {
+			stateVersion: 5,
+			lastUserThinkingLevel: "max",
+			lastSwitches: [],
+		},
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	assert.equal(
+		t.thinkingLevel(),
+		"max",
+		"the remembered user intent must be restored, not replaced by the host's clamp",
+	);
+	assert.ok(
+		!t.rec.thinkingLevels.includes("low"),
+		`the extension must never ASK for the clamped level: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+});
+
+
 // ---------------------------------------------------------------------------
 // A refusal outranks the quota meter (issue: bounced back onto a spent account)
 // ---------------------------------------------------------------------------
@@ -7444,7 +8235,7 @@ test("accounts lists provider identity, quota and routing state without credenti
 
 	await t.command("accounts");
 	const table = t.rec.notifies.at(-1) ?? "";
-	assert.match(table, /Slot\s+Alias\s+Account\s+Plan\s+Primary\s+Secondary\s+Status/);
+	assert.match(table, /Slot\s+Alias\s+Account\s+Plan\s+Primary\s+Secondary\s+Tertiary\s+Status/);
 	assert.match(table, /openai-codex-account-2\s+alice\s+alice@example\.com\s+plus/);
 	assert.match(table, /5h 80%/);
 	assert.match(table, /7d 50%/);
@@ -8249,11 +9040,21 @@ test("the footer says how many other accounts are ready, so 'switch to what?' ha
 // OAuth refresh: losing a race must not be reported as a dead account
 // ---------------------------------------------------------------------------
 
-const { refreshWithDiskRetry } = (await import("../index.ts")) as {
+const { refreshWithDiskRetry, refreshAndPersistWithStorageLock } = (await import("../index.ts")) as {
 	refreshWithDiskRetry: (opts: {
 		credentials: any;
 		refresh: (credentials: any) => Promise<any>;
 		storedRefresh: () => string | undefined;
+	}) => Promise<any>;
+	refreshAndPersistWithStorageLock: (opts: {
+		provider: string;
+		credentials: any;
+		authStorage: any;
+		readLatest: () => any;
+		refresh: (credentials: any) => Promise<any>;
+		isShadowed?: (stored: any) => boolean;
+		persistShadowed?: (credential: any) => void;
+		signal?: AbortSignal;
 	}) => Promise<any>;
 };
 
@@ -8284,6 +9085,213 @@ test("an invalid_grant is retried with the token another process just wrote", as
 		"the retry must use what is on disk now, not the credential it was handed",
 	);
 	assert.equal(result.access, "new-access", "and the refreshed token is what comes back");
+});
+
+test("Codex refresh_token_reused adopts the token another process just wrote", async () => {
+	const attempts: string[] = [];
+	const result = await refreshWithDiskRetry({
+		credentials: { type: "oauth", access: "old-access", refresh: "stale-refresh" },
+		refresh: async (credentials: any) => {
+			attempts.push(credentials.refresh);
+			if (credentials.refresh === "stale-refresh")
+				throw new Error(
+					'OpenAI Codex token refresh failed (401): {"error":{"code":"refresh_token_reused"}}',
+				);
+			return { access: "new-access", refresh: "newer-refresh", expires: 123 };
+		},
+		storedRefresh: () => "fresh-refresh-from-disk",
+	});
+
+	assert.deepEqual(attempts, ["stale-refresh", "fresh-refresh-from-disk"]);
+	assert.equal(result.access, "new-access");
+});
+
+test("two storage instances serialize Codex refresh and make one network exchange", async () => {
+	const { AuthStorage } = await import(new URL(
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
+	const root = mkdtempSync(join(tmpdir(), "codex-refresh-lock-"));
+	const path = join(root, "auth.json");
+	const provider = "openai-codex-account-3";
+	const oldCredential = {
+		type: "oauth",
+		access: "old-access",
+		refresh: "old-refresh",
+		expires: 1,
+		accountId: "account-3",
+	};
+	writeFileSync(path, JSON.stringify({ [provider]: oldCredential }));
+	const firstStorage = AuthStorage.create(path);
+	const secondStorage = AuthStorage.create(path);
+	let exchanges = 0;
+	let releaseFirst!: () => void;
+	const firstEntered = new Promise<void>((resolve) => { releaseFirst = resolve; });
+	let allowFirst!: () => void;
+	const firstGate = new Promise<void>((resolve) => { allowFirst = resolve; });
+	const refresh = async () => {
+		exchanges++;
+		if (exchanges === 1) {
+			releaseFirst();
+			await firstGate;
+		}
+		return {
+			type: "oauth",
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 86_400_000,
+			accountId: "account-3",
+		};
+	};
+	const readLatest = () => JSON.parse(readFileSync(path, "utf8"))[provider];
+
+	try {
+		const first = refreshAndPersistWithStorageLock({
+			provider,
+			credentials: oldCredential,
+			authStorage: firstStorage,
+			readLatest,
+			refresh,
+		});
+		await firstEntered;
+		const second = refreshAndPersistWithStorageLock({
+			provider,
+			credentials: oldCredential,
+			authStorage: secondStorage,
+			readLatest,
+			refresh,
+		});
+		allowFirst();
+		const [a, b] = await Promise.all([first, second]);
+
+		assert.equal(exchanges, 1, "the second process must adopt the first process's result");
+		assert.equal(a.refresh, "new-refresh");
+		assert.equal(b.refresh, "new-refresh");
+		assert.equal(readLatest().refresh, "new-refresh");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("two OS processes serialize a shadowed Codex refresh through the production sidecar", async () => {
+	const root = mkdtempSync(join(tmpdir(), "codex-refresh-processes-"));
+	const authPath = join(root, "auth.json");
+	const sidecarPath = join(root, "pi-multi-account-proxy-oauth.json");
+	const callsPath = join(root, "refresh-calls.log");
+	const provider = "openai-codex-account-3";
+	const placeholder = childFacingAuthEntryForSlot(provider)!;
+	const oldCredential = {
+		type: "oauth", access: "old-access", refresh: "old-refresh", expires: 1,
+	};
+	writeFileSync(authPath, JSON.stringify({
+		[provider]: placeholder,
+		unrelated: { type: "api_key", key: "keep" },
+	}));
+	writeFileSync(sidecarPath, JSON.stringify({ [provider]: oldCredential }));
+	const indexUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "../index.ts")).href;
+	const authStorageUrl = pathToFileURL(join(
+		dirname(fileURLToPath(import.meta.url)),
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js",
+	)).href;
+	const slotAuthUrl = pathToFileURL(join(
+		dirname(fileURLToPath(import.meta.url)), "../slot-proxy-auth.ts",
+	)).href;
+	const script = `
+		import { appendFileSync } from "node:fs";
+		import { setTimeout as sleep } from "node:timers/promises";
+		import { AuthStorage } from ${JSON.stringify(authStorageUrl)};
+		import {
+			readProxyOAuthSidecar,
+			refreshAndPersistWithStorageLock,
+			writeProxyOAuthSidecar,
+		} from ${JSON.stringify(indexUrl)};
+		import { isChildFacingPlaceholderForSlot } from ${JSON.stringify(slotAuthUrl)};
+		const provider = ${JSON.stringify(provider)};
+		const original = ${JSON.stringify(oldCredential)};
+		const result = await refreshAndPersistWithStorageLock({
+			provider,
+			credentials: original,
+			authStorage: AuthStorage.create(${JSON.stringify(authPath)}),
+			readLatest: () => readProxyOAuthSidecar()[provider],
+			refresh: async (current) => {
+				appendFileSync(${JSON.stringify(callsPath)}, "exchange\\n");
+				await sleep(150);
+				return { ...current, access: "new-access", refresh: "new-refresh", expires: 4102444800000 };
+			},
+			isShadowed: (stored) => isChildFacingPlaceholderForSlot(stored, provider),
+			persistShadowed: (credential) => writeProxyOAuthSidecar({
+				...readProxyOAuthSidecar(), [provider]: credential,
+			}),
+		});
+		if (result.refresh !== "new-refresh") process.exitCode = 2;
+	`;
+	const runChild = () =>
+		new Promise<void>((resolve, reject) => {
+			const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+				cwd: dirname(fileURLToPath(import.meta.url)),
+				env: { ...process.env, PI_CODING_AGENT_DIR: root },
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let stderr = "";
+			child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+			child.on("error", reject);
+			child.on("exit", (code) =>
+				code === 0 ? resolve() : reject(new Error(`refresh child exited ${code}: ${stderr}`)),
+			);
+		});
+
+	try {
+		await Promise.all([runChild(), runChild()]);
+		const calls = readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean);
+		assert.equal(calls.length, 1, "only one process may exchange the one-use token");
+		const auth = JSON.parse(readFileSync(authPath, "utf8"));
+		const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+		assert.deepEqual(auth[provider], placeholder, "OAuth must remain hidden from children");
+		assert.equal(auth.unrelated.key, "keep");
+		assert.equal(sidecar[provider].refresh, "new-refresh");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a shadowed Codex slot updates the sidecar without exposing OAuth in auth.json", async () => {
+	const { AuthStorage } = await import(new URL(
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
+	const root = mkdtempSync(join(tmpdir(), "codex-shadow-refresh-"));
+	const authPath = join(root, "auth.json");
+	const sidecarPath = join(root, "sidecar.json");
+	const provider = "openai-codex-account-3";
+	const placeholder = { type: "api_key", key: "placeholder" };
+	const oldCredential = {
+		type: "oauth", access: "old-access", refresh: "old-refresh", expires: 1,
+	};
+	writeFileSync(authPath, JSON.stringify({ [provider]: placeholder, unrelated: { type: "api_key", key: "keep" } }));
+	writeFileSync(sidecarPath, JSON.stringify({ [provider]: oldCredential }));
+	const storage = AuthStorage.create(authPath);
+
+	try {
+		const result = await refreshAndPersistWithStorageLock({
+			provider,
+			credentials: oldCredential,
+			authStorage: storage,
+			readLatest: () => JSON.parse(readFileSync(sidecarPath, "utf8"))[provider],
+			refresh: async () => ({
+				type: "oauth", access: "new-access", refresh: "new-refresh", expires: Date.now() + 86_400_000,
+			}),
+			isShadowed: (stored) => stored?.type === "api_key",
+			persistShadowed: (credential) => {
+				const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+				writeFileSync(sidecarPath, JSON.stringify({ ...sidecar, [provider]: credential }));
+			},
+		});
+
+		const auth = JSON.parse(readFileSync(authPath, "utf8"));
+		const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+		assert.deepEqual(auth[provider], placeholder);
+		assert.equal(auth.unrelated.key, "keep");
+		assert.equal(sidecar[provider].refresh, "new-refresh");
+		assert.equal(result.refresh, "new-refresh");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("a genuinely revoked token is not retried in a loop", async () => {
@@ -8507,6 +9515,82 @@ test("an account with a usage endpoint still honours the recheck ceiling", async
 	assert.ok(
 		minutes <= 11,
 		`a cheaply re-probed account must still come back at the ceiling; got ${minutes}m`,
+	);
+});
+
+test("accounts refresh fetches GLM CN API-key quota even with the footer disabled", async () => {
+	const t = setup({ accounts: { "zai-coding-cn": { type: "api_key", key: "cn-fixture-key" } },
+		current: { provider: "zai-coding-cn", id: "glm-test" }, config: { showUsage: false } });
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = (async (url: any, options: any) => {
+		assert.equal(String(url), ZAI_CODING_CN_USAGE_URL);
+		assert.equal(new Headers(options.headers).get("Authorization"), "cn-fixture-key");
+		calls++;
+		return Response.json({ data: { level: "pro", limits: [
+			{ type: "CREDIT_LIMIT", unit: 3, number: 5, percentage: 25, nextResetTime: Date.now() + 3_600_000 },
+		] } });
+	}) as typeof fetch;
+	try {
+		await t.fire("session_start");
+		await t.command("accounts refresh");
+		assert.ok(calls > 0);
+		assert.ok(t.rec.notifies.some((text) => text.includes("75%")), t.rec.notifies.join("\n"));
+		assert.deepEqual(t.rec.setModels, []);
+	} finally { await t.fire("session_shutdown"); globalThis.fetch = originalFetch; }
+});
+
+test("xAI cooldowns honour the cheap usage-probe recheck ceiling", async () => {
+	const t = setup({
+		accounts: {
+			xai: {
+				type: "oauth",
+				access: xaiAccessToken("xai-user-123"),
+				refresh: "xai-refresh",
+			},
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+		},
+		current: { provider: "xai", id: "grok-4.6" },
+		config: { maxRecheckIntervalMs: 600_000, cooldownMs: 21_600_000 },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"xai",
+		"grok-4.6",
+		"You have reached your usage limit. Try again in ~40000 min.",
+	);
+
+	const until = t.readState().exhaustedUntilByProvider?.xai ?? 0;
+	const minutes = Math.round((until - Date.now()) / 60_000);
+	assert.ok(
+		minutes <= 11,
+		`xAI can be re-probed without spending a user turn; got ${minutes}m`,
+	);
+});
+
+test("an xAI API key is not treated as a cheap subscription usage probe", async () => {
+	const t = setup({
+		accounts: {
+			xai: { type: "api_key", key: "xai-test-key" },
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+		},
+		current: { provider: "xai", id: "grok-4.6" },
+		config: { maxRecheckIntervalMs: 600_000, cooldownMs: 21_600_000 },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"xai",
+		"grok-4.6",
+		"You have reached your usage limit. Try again in ~40000 min.",
+	);
+
+	const until = t.readState().exhaustedUntilByProvider?.xai ?? 0;
+	const minutes = Math.round((until - Date.now()) / 60_000);
+	assert.ok(
+		minutes > 30,
+		`an xAI API key cannot be re-probed without spending a user turn; got ${minutes}m`,
 	);
 });
 
@@ -9017,6 +10101,23 @@ test("the context guard trims a mid-run request instead of letting it overflow",
 	assert.equal(messages[2].content[0].text.length, 20_000);
 });
 
+test("context guard preserves the serialized prefix until the outgoing request crosses the soft line again", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "s".repeat(24_000);
+	const initial = bigConversation(50);
+	const first = await t.fire("context", { messages: initial });
+	assert.ok(first?.messages);
+	for (let turns = 51; turns <= 54; turns++) {
+		const result = await t.fire("context", { messages: bigConversation(turns) });
+		assert.equal(JSON.stringify(result.messages.slice(0, initial.length)), JSON.stringify(first.messages),
+			"small tool turns must not progressively rewrite the cached conversation prefix");
+	}
+	const grown = await t.fire("context", { messages: bigConversation(65) });
+	assert.notEqual(JSON.stringify(grown.messages.slice(0, initial.length)), JSON.stringify(first.messages),
+		"a genuinely full outgoing request still receives another bounded batch");
+});
+
 test("the context guard asks for a real summary only once the agent has settled", async () => {
 	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
 	t.ctx.model.contextWindow = 272_000;
@@ -9248,6 +10349,27 @@ test("an automatic compaction carries the task on when explicitly enabled", asyn
 	// no cheap signal separates them, so the model is told plainly that "done" is a valid answer.
 	assert.match(text, /really is finished/i);
 	assert.match(text, /[Dd]o not restart/);
+});
+
+test("an automatic compaction continuation stays inside the current recovery chain", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { maxAutoContinuesPerPrompt: 1, continueAfterCompaction: true },
+	});
+	await t.fire("agent_start");
+	await fireCompact(t);
+	assert.equal(continuations(t).length, 1);
+
+	// Pi starts the queued custom follow-up without an input event. before_agent_start must
+	// recognise it as the continuation we just queued, not as a fresh owner prompt that resets
+	// the shared failover/compaction budget.
+	await t.fire("before_agent_start", {});
+	await fireCompact(t);
+	assert.equal(
+		continuations(t).length,
+		1,
+		"the first continuation spent the one-hop budget; compaction must not reset it",
+	);
 });
 
 test("it stays out of the way when Pi is already continuing the turn itself", async () => {

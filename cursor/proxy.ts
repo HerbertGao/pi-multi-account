@@ -16,13 +16,26 @@ import { fileURLToPath } from "node:url";
 import { estimatePromptTokens, resolveCursorUsage } from "./prompt-usage.ts";
 import { type BridgeHandle, type BridgeStreams, createBridgeHandle } from "./bridge-handle.ts";
 import { startSSEResponse } from "./sse-keepalive.ts";
-import { formatStallDuration, resolveUpstreamStallTimeoutMs, startUpstreamWatchdog } from "./upstream-watchdog.ts";
+import {
+  formatStallDuration,
+  resolveTransportStallTimeoutMs,
+  resolveUpstreamStallTimeoutMs,
+  startUpstreamWatchdog,
+} from "./upstream-watchdog.ts";
+import {
+  classifyCursorFrame,
+  mapNativeExecToPiTool,
+  NATIVE_TOOL_UNAVAILABLE,
+  resolveToolCallCoalesceMs,
+  type CursorFrameClass,
+} from "./stream-lifecycle.ts";
 import {
   requestActionText,
   historyForRebuild,
   isToolCallStep,
   parseMessages as parseMessagesPure,
   parseToolCallArguments,
+  systemPromptForRebuild,
   textContent,
   type ContentPart,
   type OpenAIMessage,
@@ -50,6 +63,9 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
+  AskQuestionInteractionResponseSchema,
+  AskQuestionRejectedSchema,
+  AskQuestionResultSchema,
   CancelActionSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
@@ -58,20 +74,42 @@ import {
   AgentConversationTurnStructureSchema,
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
+  CreatePlanErrorSchema,
+  CreatePlanRequestResponseSchema,
+  CreatePlanResultSchema,
 
   BackgroundShellSpawnResultSchema,
+  DeleteErrorSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
+  DeleteSuccessSchema,
   DiagnosticsResultSchema,
+  ExecClientControlMessageSchema,
   ExecClientMessageSchema,
+  ExecClientStreamCloseSchema,
+  ExecClientThrowSchema,
+  ExaFetchRequestResponseSchema,
+  ExaFetchRequestResponse_RejectedSchema,
+  ExaSearchRequestResponseSchema,
+  ExaSearchRequestResponse_RejectedSchema,
   FetchErrorSchema,
   FetchResultSchema,
   GetBlobResultSchema,
+  GrepContentMatchSchema,
+  GrepContentResultSchema,
   GrepErrorSchema,
+  GrepFileMatchSchema,
   GrepResultSchema,
+  GrepSuccessSchema,
+  GrepUnionResultSchema,
+  InteractionResponseSchema,
   KvClientMessageSchema,
+  LsDirectoryTreeNodeSchema,
+  LsDirectoryTreeNode_FileSchema,
+  LsErrorSchema,
   LsRejectedSchema,
   LsResultSchema,
+  LsSuccessSchema,
   McpArgsSchema,
   McpErrorSchema,
   McpResultSchema,
@@ -81,21 +119,34 @@ import {
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
+  ReadErrorSchema,
   ReadRejectedSchema,
   ReadResultSchema,
+  ReadSuccessSchema,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
   SelectedContextSchema,
   SetBlobResultSchema,
+  SetupVmEnvironmentResultSchema,
+  SetupVmEnvironmentSuccessSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ShellStreamExitSchema,
   ShellStreamSchema,
+  ShellStreamStdoutSchema,
+  ShellSuccessSchema,
+  SwitchModeRequestResponseSchema,
+  SwitchModeRequestResponse_RejectedSchema,
   ToolCallSchema,
   UserMessageActionSchema,
   UserMessageSchema,
+  WebSearchRequestResponseSchema,
+  WebSearchRequestResponse_RejectedSchema,
+  WriteErrorSchema,
   WriteRejectedSchema,
   WriteResultSchema,
+  WriteSuccessSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
   GetUsableModelsRequestSchema,
@@ -103,8 +154,11 @@ import {
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
+  type InteractionQuery,
+  type InteractionResponse,
   type KvServerMessage,
   type McpToolDefinition,
+  type ShellStream,
   type UserMessage,
 } from "./proto/agent_pb.ts";
 
@@ -149,6 +203,8 @@ interface PendingExec {
   toolCallId: string;
   toolName: string;
   decodedArgs: string;
+  resultCase?: string;
+  nativeArgs?: Record<string, unknown>;
 }
 
 export type { BridgeHandle };
@@ -217,7 +273,9 @@ function sanitizeForDebug(value: unknown): unknown {
   }
   if (typeof value === "object") {
     const entries = Object.entries(value as Record<string, unknown>).map(([key, inner]) => {
-      if (key === "accessToken") return [key, "<redacted>"] as const;
+      if (key === "accessToken" || key.toLowerCase() === "authorization") {
+        return [key, "<redacted>"] as const;
+      }
       if (key === "data" && typeof inner === "string") return [key, `<redacted base64 ${inner.length} chars>`] as const;
       return [key, sanitizeForDebug(inner)] as const;
     });
@@ -505,6 +563,11 @@ export async function startProxy(
       if (typeof addr === "object" && addr) {
         proxyPort = addr.port;
         proxyServer = server;
+        // The listener is process-scoped, not session-scoped. Do not let an idle
+        // one-shot Pi process hang just because the proxy is ready; the OS will
+        // close it when the process exits. This also lets the listener survive
+        // `/new` and other in-process session changes.
+        server.unref();
         debugLog("proxy.start", { port: proxyPort, debugLogFile: isProxyDebugEnabled() ? getDebugLogFilePath() : undefined });
         resolve(proxyPort);
       } else {
@@ -655,14 +718,11 @@ async function handleChatCompletion(
       handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, body.stream !== false, requestId, promptTokens);
       return;
     }
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
+    cleanupBridge(activeBridge.bridge, activeBridge.heartbeatTimer, bridgeKey);
   }
 
   if (activeBridge && activeBridges.has(bridgeKey)) {
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    cleanupBridge(activeBridge.bridge, activeBridge.heartbeatTimer, bridgeKey);
   }
 
   let stored = conversationStates.get(convKey);
@@ -703,20 +763,23 @@ async function handleChatCompletion(
   // original question makes the model redo work it already did, and dropping the question and
   // sending raw tool output leaves it with no task at all.
   const rebuiltTurns = historyForRebuild(parsed);
-  const effectiveUserText = requestActionText(parsed, { hasCheckpoint: !!stored.checkpoint });
+  const hasCheckpoint = !!stored.checkpoint;
+  const effectiveUserText = requestActionText(parsed, { hasCheckpoint });
+  const effectiveSystemPrompt = systemPromptForRebuild(systemPrompt, parsed, { hasCheckpoint });
   if (!stored.checkpoint) {
     debugLog("chat.no_checkpoint", { requestId, convKey, conversationId: stored.conversationId });
   }
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, rebuiltTurns,
+    modelId, effectiveSystemPrompt, effectiveUserText, rebuiltTurns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   debugLog("chat.cursor_request", {
     requestId,
     conversationId: stored.conversationId,
     effectiveUserText,
+    restoredSystemPromptChars: effectiveSystemPrompt.length - systemPrompt.length,
     turnCount: turns.length,
-    hasCheckpoint: !!stored.checkpoint,
+    hasCheckpoint,
     payload,
   });
   payload.mcpTools = mcpTools;
@@ -991,13 +1054,16 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
-): void {
+  onTurnEnded?: () => void,
+): CursorFrameClass {
   const msgCase = msg.message.case;
-  debugLog("server_message", { msgCase, msg });
+  const updateCase = msgCase === "interactionUpdate" ? (msg.message.value as { message?: { case?: string } }).message?.case : undefined;
+  const execCase = msgCase === "execServerMessage" ? (msg.message.value as { message?: { case?: string } }).message?.case : undefined;
+  let classified = classifyCursorFrame({ messageCase: msgCase, updateCase, execCase });
+  debugLog("server_message", { msgCase, updateCase, execCase, classified });
 
   if (msgCase === "interactionUpdate") {
     const update = msg.message.value as any;
-    const updateCase = update.message?.case;
     if (updateCase === "textDelta") {
       const delta = update.message.value.text || "";
       if (delta) onText(delta, false);
@@ -1006,11 +1072,15 @@ function processServerMessage(
       if (delta) onText(delta, true);
     } else if (updateCase === "tokenDelta") {
       state.outputTokens += update.message.value.tokens ?? 0;
+    } else if (classified.completesTurn) {
+      onTurnEnded?.();
     }
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
-    handleExecMessage(msg.message.value as ExecServerMessage, mcpTools, sendFrame, onMcpExec);
+    if (handleExecMessage(msg.message.value as ExecServerMessage, mcpTools, sendFrame, onMcpExec)) {
+      classified = { kind: execCase === "mcpArgs" ? "mcpExec" : "nativeExec", countsAsProgress: true, completesTurn: false };
+    }
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if ((stateStructure as any).tokenDetails) {
@@ -1019,7 +1089,12 @@ function processServerMessage(
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
+  } else if (msgCase === "interactionQuery") {
+    handleInteractionQuery(msg.message.value as InteractionQuery, sendFrame);
+  } else if (msgCase === "execServerControlMessage") {
+    debugLog("exec.control", { control: (msg.message.value as { message?: { case?: string } }).message?.case });
   }
+  return classified;
 }
 
 function sendKvResponse(
@@ -1061,14 +1136,104 @@ function handleKvMessage(
   }
 }
 
+function piToolNames(mcpTools: McpToolDefinition[]): Set<string> {
+  const names = new Set<string>();
+  for (const tool of mcpTools) {
+    if (tool.name) names.add(tool.name);
+    if (tool.toolName) names.add(tool.toolName);
+  }
+  return names;
+}
+
+function handleInteractionQuery(query: InteractionQuery, sendFrame: (data: Uint8Array) => void): void {
+  const queryCase = query.query.case;
+  const reason = NATIVE_TOOL_UNAVAILABLE;
+  let result: InteractionResponse["result"];
+  switch (queryCase) {
+    case "webSearchRequestQuery":
+      result = {
+        case: "webSearchRequestResponse",
+        value: create(WebSearchRequestResponseSchema, {
+          result: { case: "rejected", value: create(WebSearchRequestResponse_RejectedSchema, { reason }) },
+        }),
+      };
+      break;
+    case "askQuestionInteractionQuery":
+      result = {
+        case: "askQuestionInteractionResponse",
+        value: create(AskQuestionInteractionResponseSchema, {
+          result: create(AskQuestionResultSchema, {
+            result: { case: "rejected", value: create(AskQuestionRejectedSchema, { reason }) },
+          }),
+        }),
+      };
+      break;
+    case "switchModeRequestQuery":
+      result = {
+        case: "switchModeRequestResponse",
+        value: create(SwitchModeRequestResponseSchema, {
+          result: { case: "rejected", value: create(SwitchModeRequestResponse_RejectedSchema, { reason }) },
+        }),
+      };
+      break;
+    case "exaSearchRequestQuery":
+      result = {
+        case: "exaSearchRequestResponse",
+        value: create(ExaSearchRequestResponseSchema, {
+          result: { case: "rejected", value: create(ExaSearchRequestResponse_RejectedSchema, { reason }) },
+        }),
+      };
+      break;
+    case "exaFetchRequestQuery":
+      result = {
+        case: "exaFetchRequestResponse",
+        value: create(ExaFetchRequestResponseSchema, {
+          result: { case: "rejected", value: create(ExaFetchRequestResponse_RejectedSchema, { reason }) },
+        }),
+      };
+      break;
+    case "createPlanRequestQuery":
+      result = {
+        case: "createPlanRequestResponse",
+        value: create(CreatePlanRequestResponseSchema, {
+          result: create(CreatePlanResultSchema, {
+            planUri: "",
+            result: { case: "error", value: create(CreatePlanErrorSchema, { error: reason }) },
+          }),
+        }),
+      };
+      break;
+    case "setupVmEnvironmentArgs":
+      result = {
+        case: "setupVmEnvironmentResult",
+        value: create(SetupVmEnvironmentResultSchema, {
+          result: { case: "success", value: create(SetupVmEnvironmentSuccessSchema, {}) },
+        }),
+      };
+      break;
+    case undefined:
+      debugLog("interaction_query.unhandled", { queryCase });
+      return;
+    default: {
+      const _never: never = queryCase;
+      debugLog("interaction_query.unhandled", { queryCase: _never });
+      return;
+    }
+  }
+  const response = create(InteractionResponseSchema, { id: query.id, result });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, {
+    message: { case: "interactionResponse", value: response },
+  }))));
+}
+
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
-): void {
+): boolean {
   const execCase = (execMsg as any).message.case;
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+  const REJECT_REASON = NATIVE_TOOL_UNAVAILABLE;
 
   if (execCase === "requestContextArgs") {
     const requestContext = create(RequestContextSchema, {
@@ -1079,7 +1244,7 @@ function handleExecMessage(
       result: { case: "success", value: create(RequestContextSuccessSchema, { requestContext }) },
     });
     sendExecResult(execMsg, "requestContextResult", result, sendFrame);
-    return;
+    return false;
   }
 
   if (execCase === "mcpArgs") {
@@ -1091,44 +1256,61 @@ function handleExecMessage(
       toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
       toolName: mcpArgs.toolName || mcpArgs.name,
       decodedArgs: JSON.stringify(decoded),
+      resultCase: "mcpResult",
     });
-    return;
+    return true;
   }
 
-  // Reject native Cursor tools so model falls back to MCP tools
+  const nativeArgs = protoRecord((execMsg as any).message.value);
+  const mapped = mapNativeExecToPiTool(String(execCase ?? ""), nativeArgs, piToolNames(mcpTools));
+  if (mapped) {
+    onMcpExec({
+      execId: (execMsg as any).execId,
+      execMsgId: (execMsg as any).id,
+      toolCallId: typeof nativeArgs.toolCallId === "string" && nativeArgs.toolCallId
+        ? nativeArgs.toolCallId
+        : crypto.randomUUID(),
+      toolName: mapped.toolName,
+      decodedArgs: JSON.stringify(mapped.args),
+      resultCase: mapped.resultCase,
+      nativeArgs,
+    });
+    return true;
+  }
+
   if (execCase === "readArgs") {
     const args = (execMsg as any).message.value;
     sendExecResult(execMsg, "readResult", create(ReadResultSchema, {
       result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "lsArgs") {
     const args = (execMsg as any).message.value;
     sendExecResult(execMsg, "lsResult", create(LsResultSchema, {
       result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "grepArgs") {
     sendExecResult(execMsg, "grepResult", create(GrepResultSchema, {
       result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "writeArgs") {
     const args = (execMsg as any).message.value;
     sendExecResult(execMsg, "writeResult", create(WriteResultSchema, {
       result: { case: "rejected", value: create(WriteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "deleteArgs") {
     const args = (execMsg as any).message.value;
     sendExecResult(execMsg, "deleteResult", create(DeleteResultSchema, {
       result: { case: "rejected", value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "shellArgs") {
     const args = (execMsg as any).message.value;
@@ -1138,7 +1320,7 @@ function handleExecMessage(
         reason: REJECT_REASON, isReadonly: false,
       }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "shellStreamArgs") {
     const args = (execMsg as any).message.value;
@@ -1148,7 +1330,7 @@ function handleExecMessage(
         reason: REJECT_REASON, isReadonly: false,
       }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "backgroundShellSpawnArgs") {
     const args = (execMsg as any).message.value;
@@ -1158,27 +1340,26 @@ function handleExecMessage(
         reason: REJECT_REASON, isReadonly: false,
       }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "writeShellStdinArgs") {
     sendExecResult(execMsg, "writeShellStdinResult", create(WriteShellStdinResultSchema, {
       result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "fetchArgs") {
     const args = (execMsg as any).message.value;
     sendExecResult(execMsg, "fetchResult", create(FetchResultSchema, {
       result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }) },
     }), sendFrame);
-    return;
+    return false;
   }
   if (execCase === "diagnosticsArgs") {
     sendExecResult(execMsg, "diagnosticsResult", create(DiagnosticsResultSchema, {}), sendFrame);
-    return;
+    return false;
   }
 
-  // Unknown exec types
   const miscCaseMap: Record<string, string> = {
     listMcpResourcesExecArgs: "listMcpResourcesExecResult",
     readMcpResourceExecArgs: "readMcpResourceExecResult",
@@ -1188,16 +1369,31 @@ function handleExecMessage(
   const resultCase = miscCaseMap[execCase as string];
   if (resultCase) {
     sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
-    return;
+    return false;
   }
 
-  // Catch-all: log and attempt a generic rejection so the bridge doesn't hang
-  console.error(`[cursor-provider] UNHANDLED exec case: "${execCase}". Bridge may stall.`);
-  // Try to derive the result case name from the args case name
-  const guessedResult = (execCase as string)?.replace(/Args$/, "Result");
-  if (guessedResult && guessedResult !== execCase) {
-    sendExecResult(execMsg, guessedResult, create(McpResultSchema, {}), sendFrame);
-  }
+  throwUnhandledExec(execMsg, execCase, sendFrame);
+  return false;
+}
+
+function throwUnhandledExec(
+  execMsg: ExecServerMessage,
+  execCase: unknown,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  console.error(`[cursor-provider] UNHANDLED exec case: "${String(execCase)}". Rejecting so the bridge cannot stall.`);
+  const control = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "throw",
+      value: create(ExecClientThrowSchema, {
+        id: (execMsg as any).id,
+        error: `${NATIVE_TOOL_UNAVAILABLE} (unhandled ${String(execCase ?? "exec")})`,
+      }),
+    },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: control },
+  }))));
 }
 
 function sendExecResult(
@@ -1215,7 +1411,248 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  if (messageCase === "shellStream") {
+    const event = (value as ShellStream).event.case;
+    if (event === "exit" || event === "rejected" || event === "permissionDenied" || event === "backgrounded") {
+      // The exit event describes the process, not the end of the streaming exec
+      // RPC. Without streamClose Cursor keeps draining that RPC forever while
+      // Run heartbeats continue, so Pi stalls after an already completed bash.
+      sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, {
+        message: {
+          case: "execClientControlMessage",
+          value: create(ExecClientControlMessageSchema, {
+            message: { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id: execMsg.id }) },
+          }),
+        },
+      }))));
+      debugLog("exec.stream_closed", { execMsgId: execMsg.id, execId: execMsg.execId, terminalEvent: event });
+    }
+  }
 }
+
+function sendPendingExecResult(
+  exec: PendingExec,
+  value: unknown,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  sendExecResult(
+    { id: exec.execMsgId, execId: exec.execId } as ExecServerMessage,
+    exec.resultCase ?? "mcpResult",
+    value,
+    sendFrame,
+  );
+}
+
+function protoRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object") return {};
+  return { ...(value as Record<string, unknown>) };
+}
+
+function nativePath(exec: PendingExec): string {
+  const path = exec.nativeArgs?.path;
+  return typeof path === "string" ? path : "";
+}
+
+function resumePendingExecWithToolResult(
+  exec: PendingExec,
+  content: string,
+  isError: boolean,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  try {
+    resumePendingExecWithToolResultUnchecked(exec, content, isError, sendFrame);
+  } catch (err) {
+    console.error("[cursor-provider] Failed to encode tool result; throwing so Cursor cannot wait forever:", err instanceof Error ? err.message : err);
+    throwUnhandledExec(
+      { id: exec.execMsgId, execId: exec.execId } as ExecServerMessage,
+      exec.resultCase,
+      sendFrame,
+    );
+  }
+}
+
+function resumePendingExecWithToolResultUnchecked(
+  exec: PendingExec,
+  content: string,
+  isError: boolean,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const resultCase = exec.resultCase ?? "mcpResult";
+  if (resultCase === "mcpResult") {
+    sendPendingExecResult(exec, create(McpResultSchema, {
+      result: {
+        case: "success",
+        value: create(McpSuccessSchema, {
+          content: [
+            create(McpToolResultContentItemSchema, {
+              content: { case: "text", value: create(McpTextContentSchema, { text: content }) },
+            }),
+          ],
+          isError,
+        }),
+      },
+    }), sendFrame);
+    return;
+  }
+  if (resultCase === "readResult") {
+    const path = nativePath(exec);
+    sendPendingExecResult(exec, create(ReadResultSchema, isError
+      ? { result: { case: "error", value: create(ReadErrorSchema, { path, error: content }) } }
+      : {
+        result: {
+          case: "success",
+          value: create(ReadSuccessSchema, {
+            path,
+            totalLines: content.split("\n").length,
+            fileSize: BigInt(Buffer.byteLength(content)),
+            truncated: false,
+            output: { case: "content", value: content },
+          }),
+        },
+      }), sendFrame);
+    return;
+  }
+  if (resultCase === "writeResult") {
+    const path = nativePath(exec);
+    sendPendingExecResult(exec, create(WriteResultSchema, isError
+      ? { result: { case: "error", value: create(WriteErrorSchema, { path, error: content }) } }
+      : {
+        result: {
+          case: "success",
+          value: create(WriteSuccessSchema, {
+            path,
+            linesCreated: content.split("\n").length,
+            fileSize: Buffer.byteLength(content),
+            fileContentAfterWrite: content,
+          }),
+        },
+      }), sendFrame);
+    return;
+  }
+  if (resultCase === "deleteResult") {
+    const path = nativePath(exec);
+    sendPendingExecResult(exec, create(DeleteResultSchema, isError
+      ? { result: { case: "error", value: create(DeleteErrorSchema, { path, error: content }) } }
+      : {
+        result: {
+          case: "success",
+          value: create(DeleteSuccessSchema, {
+            path,
+            deletedFile: path,
+            fileSize: 0n,
+            prevContent: "",
+          }),
+        },
+      }), sendFrame);
+    return;
+  }
+  if (resultCase === "grepResult") {
+    const pattern = typeof exec.nativeArgs?.pattern === "string" ? exec.nativeArgs.pattern : "";
+    const path = nativePath(exec) || ".";
+    sendPendingExecResult(exec, create(GrepResultSchema, isError
+      ? { result: { case: "error", value: create(GrepErrorSchema, { error: content }) } }
+      : {
+        result: {
+          case: "success",
+          value: create(GrepSuccessSchema, {
+            pattern,
+            path,
+            outputMode: "content",
+            workspaceResults: {
+              [path]: create(GrepUnionResultSchema, {
+                result: {
+                  case: "content",
+                  value: create(GrepContentResultSchema, {
+                    matches: [create(GrepFileMatchSchema, {
+                      file: path,
+                      matches: content.split("\n").slice(0, 200).map((line, index) => create(GrepContentMatchSchema, {
+                        lineNumber: index + 1,
+                        content: line,
+                        contentTruncated: false,
+                      })),
+                    })],
+                    totalLines: content.split("\n").length,
+                    totalMatchedLines: content.split("\n").length,
+                    clientTruncated: content.split("\n").length > 200,
+                    ripgrepTruncated: false,
+                  }),
+                },
+              }),
+            },
+          }),
+        },
+      }), sendFrame);
+    return;
+  }
+  if (resultCase === "lsResult") {
+    const path = nativePath(exec) || ".";
+    const files = content.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 500);
+    sendPendingExecResult(exec, create(LsResultSchema, isError
+      ? { result: { case: "error", value: create(LsErrorSchema, { path, error: content }) } }
+      : {
+        result: {
+          case: "success",
+          value: create(LsSuccessSchema, {
+            directoryTreeRoot: create(LsDirectoryTreeNodeSchema, {
+              absPath: path,
+              childrenDirs: [],
+              childrenFiles: files.map((name) => create(LsDirectoryTreeNode_FileSchema, { name })),
+              childrenWereProcessed: true,
+              fullSubtreeExtensionCounts: {},
+              numFiles: files.length,
+            }),
+          }),
+        },
+      }), sendFrame);
+    return;
+  }
+  if (resultCase === "shellResult") {
+    const command = typeof exec.nativeArgs?.command === "string" ? exec.nativeArgs.command : "";
+    const workingDirectory = typeof exec.nativeArgs?.workingDirectory === "string" ? exec.nativeArgs.workingDirectory : "";
+    sendPendingExecResult(exec, create(ShellResultSchema, {
+      result: {
+        case: "success",
+        value: create(ShellSuccessSchema, {
+          command,
+          workingDirectory,
+          exitCode: isError ? 1 : 0,
+          signal: "",
+          stdout: isError ? "" : content,
+          stderr: isError ? content : "",
+          executionTime: 0,
+        }),
+      },
+    }), sendFrame);
+    return;
+  }
+  if (resultCase === "shellStream") {
+    const cwd = typeof exec.nativeArgs?.workingDirectory === "string" ? exec.nativeArgs.workingDirectory : "";
+    sendPendingExecResult(exec, create(ShellStreamSchema, {
+      event: { case: "stdout", value: create(ShellStreamStdoutSchema, { data: content }) },
+    }), sendFrame);
+    sendPendingExecResult(exec, create(ShellStreamSchema, {
+      event: {
+        case: "exit",
+        value: create(ShellStreamExitSchema, { code: isError ? 1 : 0, cwd, aborted: false }),
+      },
+    }), sendFrame);
+    return;
+  }
+  sendPendingExecResult(exec, create(McpResultSchema, {
+    result: {
+      case: "success",
+      value: create(McpSuccessSchema, {
+        content: [
+          create(McpToolResultContentItemSchema, {
+            content: { case: "text", value: create(McpTextContentSchema, { text: content }) },
+          }),
+        ],
+        isError,
+      }),
+    },
+  }), sendFrame);
+}
+
 
 // ── Key derivation ──
 
@@ -1497,10 +1934,12 @@ function cleanupBridge(
 ): void {
   debugLog("bridge.cleanup", { bridgeKey, alive: bridge.alive });
   clearInterval(heartbeatTimer);
-  if (bridge.alive) {
-    sendCancelAction(bridge);
-    bridge.end();
-  }
+  if (bridge.alive) sendCancelAction(bridge);
+  // Ending stdin alone does not terminate a streaming HTTP/2 request: Cursor may
+  // keep the response side open and the bridge process alive indefinitely. Once
+  // this Run is cancelled or stale, kill the subprocess so dead connections do
+  // not accumulate across stalls, compactions, and session switches.
+  bridge.destroy();
   activeBridges.delete(bridgeKey);
 }
 
@@ -1526,6 +1965,12 @@ function writeSSEStream(
   const stopKeepalive = startSSEResponse(res);
 
   let closed = false;
+  let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearCoalesceTimer = () => {
+    if (!coalesceTimer) return;
+    clearTimeout(coalesceTimer);
+    coalesceTimer = undefined;
+  };
   const sendSSE = (data: object) => {
     if (closed) return;
     res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -1537,7 +1982,9 @@ function writeSSEStream(
   const closeResponse = () => {
     if (closed) return;
     closed = true;
+    clearCoalesceTimer();
     stopKeepalive();
+    transportWatchdog.stop();
     upstreamWatchdog.stop();
     res.end();
   };
@@ -1547,19 +1994,38 @@ function writeSSEStream(
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   });
 
-  // Keepalives preserve the client connection; decoded progress bounds the upstream wait.
-  const upstreamWatchdog = startUpstreamWatchdog((silentForMs) => {
+  const failStalledRun = (
+    kind: "transport" | "useful_output",
+    silentForMs: number,
+  ) => {
     if (closed) return;
-    const message = `Cursor produced no output for ${formatStallDuration(silentForMs)}; stream timed out`;
-    console.error(`[cursor-provider] Upstream stall (${modelId}):`, message);
-    debugLog("stream.upstream_stall", { requestId, bridgeKey, convKey, modelId, silentForMs });
+    const missing = kind === "transport" ? "upstream frames" : "useful output";
+    const message = `Cursor Run stalled: no ${missing} for ${formatStallDuration(silentForMs)}; stream timed out`;
+    console.error(`[cursor-provider] ${kind} stall (${modelId}):`, message);
+    debugLog("stream.upstream_stall", { requestId, bridgeKey, convKey, modelId, kind, silentForMs });
     cancelled = true;
+    if (!toolCallsFlushed) {
+      for (const exec of state.pendingExecs) {
+        resumePendingExecWithToolResult(exec, message, true, (data) => bridge.write(data));
+      }
+    }
     cleanupBridge(bridge, heartbeatTimer, bridgeKey);
     sendSSE(makeChunk({ content: message }, "error"));
     sendSSE(makeUsageChunk());
     sendDone();
     closeResponse();
-  }, resolveUpstreamStallTimeoutMs());
+  };
+
+  // A decoded housekeeping frame proves the HTTP/2 transport is alive, but only
+  // visible tokens or a Pi-bound tool prove the model is making useful progress.
+  const transportWatchdog = startUpstreamWatchdog(
+    (silentForMs) => failStalledRun("transport", silentForMs),
+    resolveTransportStallTimeoutMs(),
+  );
+  const upstreamWatchdog = startUpstreamWatchdog(
+    (silentForMs) => failStalledRun("useful_output", silentForMs),
+    resolveUpstreamStallTimeoutMs(),
+  );
 
   const makeUsageChunk = () => {
     const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
@@ -1573,8 +2039,78 @@ function writeSSEStream(
   const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0, promptTokenEstimate };
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
+  let toolCallsFlushed = false;
   let cancelled = false;
   let latestCheckpoint: Uint8Array | null = null;
+  const coalesceMs = resolveToolCallCoalesceMs();
+
+  const flushPiToolCalls = () => {
+    clearCoalesceTimer();
+    if (closed || cancelled || toolCallsFlushed || state.pendingExecs.length === 0) return;
+    toolCallsFlushed = true;
+    mcpExecReceived = true;
+
+    const flushed = tagFilter.flush();
+    if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+    if (flushed.content) {
+      appendAssistantTextToTurn(currentTurn, flushed.content);
+      sendSSE(makeChunk({ content: flushed.content }));
+    }
+
+    for (const exec of state.pendingExecs) {
+      const toolCallIndex = state.toolCallIndex++;
+      sendSSE(makeChunk({
+        tool_calls: [{
+          index: toolCallIndex, id: exec.toolCallId, type: "function",
+          function: { name: exec.toolName, arguments: exec.decodedArgs },
+        }],
+      }));
+    }
+
+    activeBridges.set(bridgeKey, {
+      bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
+    });
+    debugLog("stream.tool_call_pause", { requestId, bridgeKey, pendingExecs: state.pendingExecs, currentTurn });
+
+    sendSSE(makeChunk({}, "tool_calls"));
+    sendSSE(makeUsageChunk());
+    sendDone();
+    closeResponse();
+  };
+
+  const queuePiTool = (exec: PendingExec) => {
+    if (closed || cancelled || toolCallsFlushed) {
+      debugLog("stream.late_exec_rejected", { requestId, bridgeKey, exec });
+      resumePendingExecWithToolResult(exec, NATIVE_TOOL_UNAVAILABLE, true, (data) => bridge.write(data));
+      return;
+    }
+    state.pendingExecs.push(exec);
+    mcpExecReceived = true;
+    currentTurn.steps.push({
+      kind: "toolCall",
+      toolCallId: exec.toolCallId,
+      toolName: exec.toolName,
+      arguments: parseToolCallArguments(exec.decodedArgs),
+    });
+    clearCoalesceTimer();
+    coalesceTimer = setTimeout(flushPiToolCalls, coalesceMs);
+    coalesceTimer.unref?.();
+  };
+
+  const finishOpenAITurn = () => {
+    if (closed || mcpExecReceived) return;
+    const flushed = tagFilter.flush();
+    if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+    if (flushed.content) {
+      appendAssistantTextToTurn(currentTurn, flushed.content);
+      sendSSE(makeChunk({ content: flushed.content }));
+    }
+    sendSSE(makeChunk({}, "stop"));
+    sendSSE(makeUsageChunk());
+    sendDone();
+    closeResponse();
+    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+  };
 
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
@@ -1591,13 +2127,8 @@ function writeSSEStream(
     (messageBytes) => {
       try {
         const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-        if (serverMessage.message.case !== undefined &&
-          (serverMessage.message.case !== "interactionUpdate" ||
-            (serverMessage.message.value.message.case !== undefined &&
-              serverMessage.message.value.message.case !== "heartbeat"))) {
-          upstreamWatchdog.touch();
-        }
-        processServerMessage(
+        transportWatchdog.touch();
+        const classified = processServerMessage(
           serverMessage, blobStore, mcpTools,
           (data) => bridge.write(data),
           state,
@@ -1614,40 +2145,7 @@ function writeSSEStream(
             }
           },
           (exec) => {
-            state.pendingExecs.push(exec);
-            mcpExecReceived = true;
-
-            const flushed = tagFilter.flush();
-            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-            if (flushed.content) {
-              appendAssistantTextToTurn(currentTurn, flushed.content);
-              sendSSE(makeChunk({ content: flushed.content }));
-            }
-
-            currentTurn.steps.push({
-              kind: "toolCall",
-              toolCallId: exec.toolCallId,
-              toolName: exec.toolName,
-              arguments: parseToolCallArguments(exec.decodedArgs),
-            });
-
-            const toolCallIndex = state.toolCallIndex++;
-            sendSSE(makeChunk({
-              tool_calls: [{
-                index: toolCallIndex, id: exec.toolCallId, type: "function",
-                function: { name: exec.toolName, arguments: exec.decodedArgs },
-              }],
-            }));
-
-            activeBridges.set(bridgeKey, {
-              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
-            });
-            debugLog("stream.tool_call_pause", { requestId, bridgeKey, exec, pendingExecs: state.pendingExecs, currentTurn });
-
-            sendSSE(makeChunk({}, "tool_calls"));
-            sendSSE(makeUsageChunk());
-            sendDone();
-            closeResponse();
+            queuePiTool(exec);
           },
           (checkpointBytes) => {
             latestCheckpoint = checkpointBytes;
@@ -1660,7 +2158,12 @@ function writeSSEStream(
             }
             debugLog("stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
           },
+          () => {
+            debugLog("stream.turn_ended", { requestId, bridgeKey, convKey, mcpExecReceived, closed });
+            finishOpenAITurn();
+          },
         );
+        if (classified.countsAsProgress) upstreamWatchdog.touch();
       } catch (err) {
         console.error("[cursor-provider] Stream message processing error:", err instanceof Error ? err.message : err);
       }
@@ -1681,7 +2184,9 @@ function writeSSEStream(
   bridge.onData(processChunk);
 
   bridge.onClose((code) => {
-    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, currentTurn, latestCheckpoint });
+    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, toolCallsFlushed, currentTurn, latestCheckpoint });
+    clearCoalesceTimer();
+    transportWatchdog.stop();
     upstreamWatchdog.stop();
     clearInterval(heartbeatTimer);
     req.removeListener("close", onClientClose);
@@ -1695,15 +2200,11 @@ function writeSSEStream(
         debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
       }
     }
-    if (cancelled) return;
+    if (cancelled || closed) return;
     if (!mcpExecReceived) {
-      const flushed = tagFilter.flush();
-      if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-      if (flushed.content) {
-        appendAssistantTextToTurn(currentTurn, flushed.content);
-        sendSSE(makeChunk({ content: flushed.content }));
-      }
-      sendSSE(makeChunk({}, "stop"));
+      finishOpenAITurn();
+    } else if (!toolCallsFlushed) {
+      sendSSE(makeChunk({ content: "Cursor ended the turn before tools could run" }, "error"));
       sendSSE(makeUsageChunk());
       sendDone();
       closeResponse();
@@ -1790,35 +2291,10 @@ function handleToolResultResume(
     return;
   }
 
-  for (const exec of pendingExecs) {
-    const result = turnResults.get(exec.toolCallId);
-    if (!result) continue;
-    const mcpResult = create(McpResultSchema, {
-      result: {
-        case: "success",
-        value: create(McpSuccessSchema, {
-          content: [
-            create(McpToolResultContentItemSchema, {
-              content: { case: "text", value: create(McpTextContentSchema, { text: result.content }) },
-            }),
-          ],
-          isError: false,
-        }),
-      },
-    });
-
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: { case: "mcpResult" as any, value: mcpResult as any },
-    });
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
-    debugLog("tool_resume.sent_result", { requestId, exec, result });
-  }
-
+  // Listen on the new OpenAI stream BEFORE writing exec results. Cursor often
+  // replies in the same tick (text, thinking, the next exec, turnEnded). The
+  // paused writer already called res.end(), so those frames used to land on a
+  // closed SSE and vanish. Pi then sat on Working until the upstream stall watchdog fired.
   // Tool results belong to the same user turn that initiated the tool calls.
   // parseMessages keeps tool continuations out of completed history, so completedTurns
   // already reflects the correct history covered before this in-flight turn.
@@ -1836,6 +2312,38 @@ function handleToolResultResume(
     res,
     requestId,
     promptTokenEstimate,
+  );
+
+  for (const exec of pendingExecs) {
+    const result = turnResults.get(exec.toolCallId);
+    if (!result) continue;
+    resumePendingExecWithToolResult(exec, result.content, result.isError, (data) => bridge.write(data));
+    debugLog("tool_resume.sent_result", { requestId, exec, result });
+  }
+}
+
+export function resumeCursorToolResultsForTests(
+  active: ActiveBridge,
+  toolResults: ToolResultInfo[],
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: {
+    modelId: string;
+    bridgeKey: string;
+    convKey: string;
+    completedTurns?: ParsedTurn[];
+  },
+): void {
+  handleToolResultResume(
+    active,
+    toolResults,
+    opts.modelId,
+    opts.bridgeKey,
+    opts.convKey,
+    opts.completedTurns ?? [],
+    req,
+    res,
+    true,
   );
 }
 
@@ -1879,6 +2387,69 @@ async function handleNonStreamingResponse(
   let latestCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
+    let settled = false;
+
+    const endBridge = () => {
+      clearInterval(heartbeatTimer);
+      if (bridge.alive) {
+        sendCancelAction(bridge);
+        bridge.end();
+      }
+    };
+
+    const commitCheckpoint = () => {
+      const stored = conversationStates.get(convKey);
+      if (!stored) return;
+      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+      stored.lastAccessMs = Date.now();
+      if (!cancelled && !nonStreamError && latestCheckpoint) {
+        stored.checkpoint = latestCheckpoint;
+        debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
+      }
+    };
+
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      req.removeListener("close", onClientClose);
+      res.removeListener("close", onClientClose);
+      commitCheckpoint();
+
+      if (cancelled) {
+        if (!res.headersSent) {
+          res.writeHead(499, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Client closed request", type: "aborted", code: "client_closed" } }));
+        }
+        endBridge();
+        resolve();
+        return;
+      }
+
+      if (nonStreamError) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: { message: nonStreamError.message, type: "upstream_error", code: "cursor_error" },
+        }));
+        endBridge();
+        resolve();
+        return;
+      }
+
+      const flushed = tagFilter.flush();
+      fullText += flushed.content;
+      appendAssistantTextToTurn(currentTurn, flushed.content);
+      const usage = computeUsage(state);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: completionId, object: "chat.completion", created, model: modelId,
+        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+        usage,
+      }));
+      endBridge();
+      resolve();
+    };
+
     bridge.onData(createConnectFrameParser(
       (messageBytes) => {
         try {
@@ -1893,17 +2464,28 @@ async function handleNonStreamingResponse(
               fullText += content;
               appendAssistantTextToTurn(currentTurn, content);
             },
-            () => {},
+            (exec) => {
+              resumePendingExecWithToolResult(
+                exec,
+                "Tools are not available on this non-streaming request.",
+                true,
+                (data) => bridge.write(data),
+              );
+            },
             (checkpointBytes) => {
               latestCheckpoint = checkpointBytes;
               const stored = conversationStates.get(convKey);
               if (stored) {
                 stored.checkpoint = checkpointBytes;
                 for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-  
+
                 stored.lastAccessMs = Date.now();
               }
               debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
+            },
+            () => {
+              debugLog("nonstream.turn_ended", { requestId, convKey });
+              settle();
             },
           );
         } catch (err) {
@@ -1921,50 +2503,8 @@ async function handleNonStreamingResponse(
     ));
 
     bridge.onClose(() => {
-      debugLog("nonstream.bridge_close", { requestId, convKey, cancelled, nonStreamError: nonStreamError?.message, currentTurn, latestCheckpoint });
-      clearInterval(heartbeatTimer);
-      req.removeListener("close", onClientClose);
-      res.removeListener("close", onClientClose);
-      const stored = conversationStates.get(convKey);
-      if (stored) {
-        for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-        stored.lastAccessMs = Date.now();
-        if (!cancelled && !nonStreamError && latestCheckpoint) {
-          stored.checkpoint = latestCheckpoint;
-          debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
-        }
-      }
-
-      if (cancelled) {
-        if (!res.headersSent) {
-          res.writeHead(499, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "Client closed request", type: "aborted", code: "client_closed" } }));
-        }
-        resolve();
-        return;
-      }
-
-      if (nonStreamError) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: { message: nonStreamError.message, type: "upstream_error", code: "cursor_error" },
-        }));
-        resolve();
-        return;
-      }
-
-      const flushed = tagFilter.flush();
-      fullText += flushed.content;
-      appendAssistantTextToTurn(currentTurn, flushed.content);
-      const usage = computeUsage(state);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        id: completionId, object: "chat.completion", created, model: modelId,
-        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
-        usage,
-      }));
-      resolve();
+      debugLog("nonstream.bridge_close", { requestId, convKey, cancelled, settled, nonStreamError: nonStreamError?.message, currentTurn, latestCheckpoint });
+      settle();
     });
   });
 }

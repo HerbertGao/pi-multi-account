@@ -8,7 +8,6 @@ export function registerSessionLifecycleHooks(
     cleanupSessionState: (sessionId: string) => void;
     /** Start a new Cursor-side conversation, keeping the session alive. */
     resetConversationForSession?: (sessionId: string) => void;
-    stopProxy: () => void;
     debug?: (event: string, data: Record<string, unknown>) => void;
   },
 ): void {
@@ -37,8 +36,5 @@ export function registerSessionLifecycleHooks(
   }) as any);
   pi.on("session_shutdown", ((event: unknown, ctx: SessionContext) => {
     cleanupCurrentSession(event, ctx);
-    // The proxy is process-scoped. Leaving its referenced HTTP listener open after Pi's
-    // shutdown makes one-shot `pi -p` delegation print the right answer and then hang forever.
-    dependencies.stopProxy();
   }) as any);
 }
