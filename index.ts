@@ -166,6 +166,10 @@ type PiAiOauthBridge = {
 		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
 		getApiKey: (credentials: any) => string;
 	};
+	/** xAI subscription OAuth exists only in pi-ai's provider-factories era. */
+	xai?: {
+		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
+	};
 };
 
 let piAiOauthBridge: PiAiOauthBridge | undefined;
@@ -304,10 +308,12 @@ function adaptProviderFactories(
 	anthropicMod: any,
 	codexMod: any,
 	kimiMod?: any,
+	xaiMod?: any,
 ): PiAiOauthBridge | undefined {
 	const anthropicOauth = anthropicMod?.anthropicProvider?.()?.auth?.oauth;
 	const codexOauth = codexMod?.openaiCodexProvider?.()?.auth?.oauth;
 	const kimiOauth = kimiMod?.kimiCodingProvider?.()?.auth?.oauth;
+	const xaiOauth = xaiMod?.xaiProvider?.()?.auth?.oauth;
 	if (
 		typeof anthropicOauth?.login !== "function" ||
 		typeof anthropicOauth?.refresh !== "function" ||
@@ -338,6 +344,12 @@ function adaptProviderFactories(
 						login: (callbacks) => kimiOauth.login(toAuthInteraction(callbacks)),
 						refresh: (credentials, signal) => kimiOauth.refresh(credentials, signal),
 						getApiKey: (credentials) => credentials.access,
+					}
+				: undefined,
+		xai:
+			typeof xaiOauth?.refresh === "function"
+				? {
+						refresh: (credentials, signal) => xaiOauth.refresh(credentials, signal),
 					}
 				: undefined,
 	};
@@ -384,6 +396,7 @@ function tryLoadPiAiOauth(): PiAiOauthBridge | undefined {
 		load(join("providers", "anthropic.js")),
 		load(join("providers", "openai-codex.js")),
 		load(join("providers", "kimi-coding.js")),
+		load(join("providers", "xai.js")),
 	);
 	if (modern) {
 		piAiOauthBridge = modern;
@@ -4859,6 +4872,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					entry,
 					await refreshCursorCredentials(entry.refresh),
 				);
+			} else if (provider === "xai") {
+				const xai = requirePiAiOauth().xai;
+				if (!xai) return { status: "unsupported" };
+				const signal = AbortSignal.timeout(30_000);
+				const refreshedXai = await refreshWithDiskRetry({
+					credentials: entry,
+					refresh: (credentials) => xai.refresh(credentials, signal),
+					storedRefresh: () => storedRefreshToken(provider),
+				});
+				refreshed = mergeRefreshedCredentials(entry, refreshedXai);
 			} else {
 				return { status: "unsupported" };
 			}
@@ -5476,9 +5499,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		const providers = [
 			...new Set(
-				rotation.filter(
-					(provider) =>
-						!!usageFamily(provider) && providerHasUsableAuth(ctx, provider),
+				[...rotation, ctx?.model?.provider].filter(
+					(provider): provider is string =>
+						typeof provider === "string" &&
+						!!usageFamily(provider) &&
+						providerHasUsableAuth(ctx, provider),
 				),
 			),
 		];
@@ -5962,12 +5987,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	/**
 	 * Whether this account's availability can be checked WITHOUT spending a user turn.
 	 *
-	 * Codex, Anthropic, Ollama and Cursor all publish something we can poll in the background.
-	 * Kimi and Qwen publish nothing, so their only "probe" is a real request that costs the user
-	 * the turn it lands on.
+	 * Codex, Anthropic, Ollama, Cursor and xAI subscription OAuth all publish something we can poll
+	 * in the background. Kimi, Qwen and xAI API keys publish nothing, so their only "probe" is a
+	 * real request that costs the user the turn it lands on.
 	 */
 	function hasCheapAvailabilityProbe(provider: string): boolean {
 		const family = usageFamily(provider);
+		if (family === "xai") return readAuthFile()[provider]?.type === "oauth";
 		return (
 			family === "codex" ||
 			family === "anthropic" ||
@@ -9249,7 +9275,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const snapshot = await refreshUsage(ctx, provider, arg1 === "refresh");
+			const snapshot = await refreshUsage(ctx, provider, arg1 === "refresh", true);
 			const warning = usageErrors.get(provider);
 			if (!snapshot) {
 				ctx.ui.notify(

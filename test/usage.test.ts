@@ -5,6 +5,11 @@ import {
 	formatUsageCompact,
 	parseAnthropicUsageBody,
 	parseCodexUsageBody,
+	parseXaiUsageBody,
+	usageFamily,
+	xaiHostClientVersion,
+	xaiUserIdFromAccessToken,
+	XAI_SUBSCRIPTION_USAGE_URL,
 	parseCodexUsageHeaders,
 	parseCursorCurrentPeriodUsage,
 	parseCursorSandUsage,
@@ -503,4 +508,264 @@ test("Cursor parsers accept the snake_case wire shape and refuse to invent windo
 		undefined,
 		"a percent without a reset is not a window",
 	);
+});
+
+function unsignedJwt(payload: Record<string, unknown>): string {
+	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString(
+		"base64url",
+	);
+	const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+	return `${header}.${body}.sig`;
+}
+
+test("xAI is a usage family for the base slot and numbered aliases", () => {
+	assert.equal(usageFamily("xai"), "xai");
+	assert.equal(usageFamily("xai-account-2"), "xai");
+	assert.equal(usageFamily("cursor"), "cursor", "Cursor Grok must not be classified as xAI");
+	assert.equal(usageFamily("openai-codex"), "codex");
+});
+
+test("xAI user id comes from JWT sub / principal_id, never a generic accountId", () => {
+	assert.equal(
+		xaiUserIdFromAccessToken(unsignedJwt({ sub: "xai-user-123", principal_id: "other-id" })),
+		"xai-user-123",
+	);
+	assert.equal(
+		xaiUserIdFromAccessToken(unsignedJwt({ principal_id: "principal-only" })),
+		"principal-only",
+	);
+	assert.equal(xaiUserIdFromAccessToken(unsignedJwt({ sub: "   " })), undefined);
+	assert.equal(xaiUserIdFromAccessToken("not-a-jwt"), undefined);
+});
+
+test("parses modern SuperGrok billing credits and labels the period by length", () => {
+	const snapshot = parseXaiUsageBody(
+		"xai",
+		{
+			config: {
+				creditUsagePercent: 42.5,
+				currentPeriod: {
+					type: "USAGE_PERIOD_TYPE_WEEKLY",
+					start: "2026-06-08T00:00:00Z",
+					end: "2026-06-15T00:00:00Z",
+				},
+				productUsage: [{ product: "GrokBuild", usagePercent: 61.2 }],
+				onDemandCap: { val: 5_000 },
+				onDemandUsed: { val: 300 },
+			},
+			subscriptionTier: "ignored-plan",
+		},
+		NOW,
+		"credential",
+	);
+	assert.ok(snapshot);
+	assert.equal(snapshot.family, "xai");
+	assert.equal(snapshot.primary?.usedPercent, 42.5);
+	assert.equal(snapshot.primary?.resetAt, Date.UTC(2026, 5, 15, 0, 0, 0));
+	assert.equal(snapshot.primary?.windowSeconds, 7 * 24 * 60 * 60);
+	assert.equal(snapshot.secondary, undefined);
+	assert.equal(
+		formatUsageCompact(snapshot, NOW),
+		"xAI | 7d 58% left/1d12h",
+	);
+	assert.doesNotMatch(JSON.stringify(snapshot), /GrokBuild|ignored-plan|PRODUCT_GROK_BUILD/);
+});
+
+test("xAI falls back to Grok Build productUsage when creditUsagePercent is absent", () => {
+	const snapshot = parseXaiUsageBody(
+		"xai-account-2",
+		{
+			config: {
+				currentPeriod: {
+					type: "USAGE_PERIOD_TYPE_WEEKLY",
+					start: "2026-06-08T00:00:00Z",
+					end: "2026-06-15T00:00:00Z",
+				},
+				productUsage: [{ product: "PRODUCT_GROK_BUILD", usagePercent: 18 }],
+			},
+		},
+		NOW,
+	);
+	assert.ok(snapshot);
+	assert.equal(snapshot.primary?.usedPercent, 18);
+	assert.equal(
+		formatUsageCompact(snapshot, NOW),
+		"xAI A2 | 7d 82% left/1d12h",
+	);
+});
+
+test("xAI treats an omitted modern percentage as zero for a valid current period", () => {
+	const snapshot = parseXaiUsageBody(
+		"xai",
+		{
+			config: {
+				currentPeriod: {
+					type: "USAGE_PERIOD_TYPE_WEEKLY",
+					start: "2026-06-08T00:00:00Z",
+					end: "2026-06-15T00:00:00Z",
+				},
+			},
+		},
+		NOW,
+	);
+	assert.equal(snapshot?.primary?.usedPercent, 0);
+});
+
+test("xAI prefers modern credit percent over legacy monthlyLimit/used", () => {
+	const legacy = parseXaiUsageBody(
+		"xai",
+		{
+			config: {
+				monthlyLimit: { val: 2_000 },
+				used: { val: 500 },
+				billingPeriodStart: "2026-06-01T00:00:00Z",
+				billingPeriodEnd: "2026-07-01T00:00:00Z",
+			},
+		},
+		NOW,
+	);
+	const modern = parseXaiUsageBody(
+		"xai",
+		{
+			config: {
+				creditUsagePercent: 10,
+				currentPeriod: {
+					start: "2026-06-08T00:00:00Z",
+					end: "2026-06-15T00:00:00Z",
+				},
+				monthlyLimit: { val: 2_000 },
+				used: { val: 1_500 },
+			},
+		},
+		NOW,
+	);
+	assert.equal(legacy?.primary?.usedPercent, 25);
+	assert.equal(legacy?.primary?.windowSeconds, 30 * 24 * 60 * 60);
+	assert.match(formatUsageCompact(legacy!, NOW), /30d 75% left/);
+	assert.equal(modern?.primary?.usedPercent, 10);
+});
+
+test("xAI does not invent or mix partial period shapes", () => {
+	assert.equal(
+		parseXaiUsageBody("xai", { config: { creditUsagePercent: 12 } }, NOW),
+		undefined,
+	);
+	assert.equal(
+		parseXaiUsageBody(
+			"xai",
+			{
+				config: {
+					creditUsagePercent: 12,
+					currentPeriod: { start: "not-an-instant", end: "2026-06-15T00:00:00Z" },
+					billingPeriodStart: "2026-06-01T00:00:00Z",
+					billingPeriodEnd: "2026-07-01T00:00:00Z",
+				},
+			},
+			NOW,
+		),
+		undefined,
+		"a modern percentage must not borrow legacy period metadata",
+	);
+	assert.equal(
+		parseXaiUsageBody(
+			"xai",
+			{
+				config: {
+					creditUsagePercent: 12,
+					currentPeriod: {
+						start: "2026-05-01T00:00:00Z",
+						end: "2026-05-08T00:00:00Z",
+					},
+				},
+			},
+			NOW,
+		),
+		undefined,
+		"an expired period must not clear a current cooldown with stale headroom",
+	);
+});
+
+test("xAI usage fetch sends conservative headers and never exposes the token", async () => {
+	const now = Date.now();
+	const access = unsignedJwt({
+		sub: "xai-user-123",
+		principal_id: "xai-user-123",
+	});
+	let seen: { url: string; method: string; headers: Headers } | undefined;
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		seen = {
+			url: String(input),
+			method: init?.method ?? "GET",
+			headers: new Headers(init?.headers),
+		};
+		return new Response(
+			JSON.stringify({
+				config: {
+					creditUsagePercent: 2,
+					currentPeriod: {
+						type: "USAGE_PERIOD_TYPE_WEEKLY",
+						start: new Date(now - 86_400_000).toISOString(),
+						end: new Date(now + 6 * 86_400_000).toISOString(),
+					},
+				},
+			}),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
+	}) as typeof fetch;
+
+	const snapshot = await fetchUsageSnapshot(
+		"xai",
+		{
+			type: "oauth",
+			access,
+			accountId: "must-not-be-used-as-xai-user-id",
+		},
+		{ fetchImpl, credentialHash: "safe-hash" },
+	);
+	assert.equal(seen?.url, XAI_SUBSCRIPTION_USAGE_URL);
+	assert.equal(seen?.method, "GET");
+	assert.equal(seen?.headers.get("Authorization"), `Bearer ${access}`);
+	assert.equal(seen?.headers.get("Accept"), "application/json");
+	assert.equal(seen?.headers.get("X-XAI-Token-Auth"), "xai-grok-cli");
+	assert.equal(seen?.headers.get("x-userid"), "xai-user-123");
+	assert.notEqual(seen?.headers.get("x-userid"), "must-not-be-used-as-xai-user-id");
+	assert.equal(seen?.headers.get("x-grok-client-mode"), "headless");
+	const clientVersion = seen?.headers.get("x-grok-client-version") ?? "";
+	assert.match(clientVersion, /^pi-multi-account(\/|$)/);
+	assert.equal(clientVersion, xaiHostClientVersion());
+	assert.doesNotMatch(clientVersion, /grok-cli\/\d/);
+	assert.equal(snapshot.family, "xai");
+	assert.equal(snapshot.primary?.usedPercent, 2);
+	assert.equal(snapshot.credentialHash, "safe-hash");
+	assert.ok(!JSON.stringify(snapshot).includes(access));
+	assert.ok(!JSON.stringify(snapshot).includes("must-not-be-used"));
+});
+
+test("an xAI API key reports itself instead of throwing", async () => {
+	const snapshot = await fetchUsageSnapshot("xai", {
+		type: "api_key",
+		key: "xai-test-key",
+	});
+	assert.equal(snapshot.family, "xai");
+	assert.equal(snapshot.primary, undefined, "no window may be invented for XAI_API_KEY");
+	assert.match(snapshot.plan ?? "", /api-key|no usage endpoint/i);
+	assert.doesNotMatch(JSON.stringify(snapshot), /xai-test-key/);
+});
+
+test("xAI usage fetch refuses to send a request without a JWT user id", async () => {
+	let called = false;
+	const fetchImpl = (async () => {
+		called = true;
+		return new Response("{}", { status: 200 });
+	}) as typeof fetch;
+	await assert.rejects(
+		() =>
+			fetchUsageSnapshot(
+				"xai",
+				{ type: "oauth", access: "not-a-jwt", accountId: "generic-account" },
+				{ fetchImpl },
+			),
+		/no user id/i,
+	);
+	assert.equal(called, false);
 });

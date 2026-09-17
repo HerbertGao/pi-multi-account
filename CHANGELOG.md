@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SuperGrok / xAI OAuth subscription billing usage in the footer and limits command (PR #53). API-key usage remains unknown; private endpoint schema is best-effort.
+
 - **Background completions now route through Agent Pi, not through another extension.** On Pi 0.85.1 or newer, Multi Account registers one credentialless `registerCompletionRouter` implementation. Hermes and other callers use `ctx.requestCompletion`; this extension sees only operation IDs, model identities, and provider-owned attempt facts. Quota/auth/model/transport failures share cooldown state with foreground routing, but the operation-local lease never calls `pi.setModel` or queues a continuation. Route selection now records `completion_route_select` / `completion_route_unusable` in the debug log so a skipped session route is inspectable without coupling to the caller.
 
 ### Fixed
