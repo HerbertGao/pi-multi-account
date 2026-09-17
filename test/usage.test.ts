@@ -6,6 +6,8 @@ import {
 	parseAnthropicUsageBody,
 	parseCodexUsageBody,
 	parseXaiUsageBody,
+	parseZaiCodingCnUsageBody,
+	ZAI_CODING_CN_USAGE_URL,
 	usageFamily,
 	xaiHostClientVersion,
 	xaiUserIdFromAccessToken,
@@ -594,7 +596,7 @@ test("xAI falls back to Grok Build productUsage when creditUsagePercent is absen
 	);
 });
 
-test("xAI treats an omitted modern percentage as zero for a valid current period", () => {
+test("xAI treats an omitted modern percentage as unknown even for a valid period", () => {
 	const snapshot = parseXaiUsageBody(
 		"xai",
 		{
@@ -608,7 +610,7 @@ test("xAI treats an omitted modern percentage as zero for a valid current period
 		},
 		NOW,
 	);
-	assert.equal(snapshot?.primary?.usedPercent, 0);
+	assert.equal(snapshot, undefined);
 });
 
 test("xAI prefers modern credit percent over legacy monthlyLimit/used", () => {

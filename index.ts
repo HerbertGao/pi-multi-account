@@ -5994,6 +5994,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function hasCheapAvailabilityProbe(provider: string): boolean {
 		const family = usageFamily(provider);
 		if (family === "xai") return readAuthFile()[provider]?.type === "oauth";
+		if (family === "zai-coding-cn") return readAuthFile()[provider]?.type === "api_key";
 		return (
 			family === "codex" ||
 			family === "anthropic" ||

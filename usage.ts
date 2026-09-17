@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen" | "kimi-coding" | "xai";
+export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen" | "kimi-coding" | "xai" | "zai-coding-cn";
 
 export type UsageWindow = {
 	usedPercent: number;
@@ -75,6 +75,7 @@ function record(value: unknown): Record<string, any> {
 }
 
 function finiteNumber(value: unknown): number | undefined {
+	if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return undefined;
 	const number = typeof value === "number" ? value : Number(value);
 	return Number.isFinite(number) ? number : undefined;
 }
@@ -115,6 +116,7 @@ export function usageFamily(provider: string): UsageFamily | undefined {
 	if (provider === "alibaba" || /^alibaba-account-\d+$/.test(provider) || /^qwen/i.test(provider)) return "qwen";
 	if (provider === "kimi-coding" || /^kimi-coding-account-\d+$/.test(provider)) return "kimi-coding";
 	if (provider === "xai" || /^xai-account-\d+$/.test(provider)) return "xai";
+	if (provider === "zai-coding-cn" || /^zai-coding-cn-account-\d+$/.test(provider)) return "zai-coding-cn";
 	return undefined;
 }
 
@@ -709,11 +711,9 @@ export function parseXaiUsageBody(
 				)
 			: undefined;
 	}
-	// The modern endpoint omits the percentage for an unused allowance. Only infer zero when the
-	// complete current period proves that this is the modern response shape.
-	if (modernPeriod) {
-		return xaiUsageSnapshot(provider, 0, modernPeriod, fetchedAt, credentialHash);
-	}
+	// A period alone is not evidence of unused quota. Private endpoint schema
+	// drift must never manufacture headroom and clear a real cooldown.
+	if (config.currentPeriod !== undefined) return undefined;
 
 	const legacyPeriod = xaiUsagePeriod(
 		{ start: config.billingPeriodStart, end: config.billingPeriodEnd },
@@ -721,8 +721,8 @@ export function parseXaiUsageBody(
 	);
 	if (!legacyPeriod) return undefined;
 	const monthlyLimit = finiteNumber(record(config.monthlyLimit).val);
-	const used = finiteNumber(record(config.used).val) ?? 0;
-	if (monthlyLimit === undefined || monthlyLimit <= 0 || used < 0) return undefined;
+	const used = finiteNumber(record(config.used).val);
+	if (monthlyLimit === undefined || monthlyLimit <= 0 || used === undefined || used < 0) return undefined;
 	const legacyUsedPercent = percent((used / monthlyLimit) * 100);
 	return legacyUsedPercent === undefined
 		? undefined
@@ -803,6 +803,57 @@ async function fetchXaiUsageSnapshot(
 	}
 }
 
+export const ZAI_CODING_CN_USAGE_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
+
+/** Only provider-reported model credit windows; MCP counts are not model quota. */
+export function parseZaiCodingCnUsageBody(
+	provider: string, body: unknown, fetchedAt = Date.now(), credentialHash?: string,
+): UsageSnapshot | undefined {
+	const source = record(body);
+	if (source.success === false || (source.code !== undefined && ![0, 200, "0", "200"].includes(source.code))) return undefined;
+	const data = record(source.data);
+	if (!Array.isArray(data.limits)) return undefined;
+	const snapshot: UsageSnapshot = { provider, family: "zai-coding-cn", fetchedAt, credentialHash };
+	if (typeof data.level === "string" && data.level.trim()) snapshot.plan = data.level.trim();
+	for (const value of data.limits) {
+		const item = record(value);
+		if (item.type !== "CREDIT_LIMIT" && item.type !== "TOKENS_LIMIT") continue;
+		const unit = finiteNumber(item.unit);
+		const count = finiteNumber(item.number);
+		const seconds = unit === 3 && count === 5 ? 5 * 3600 : unit === 6 && count === 1 ? 7 * 86400 : undefined;
+		const usedPercent = percent(item.percentage);
+		const resetAt = epochMs(item.nextResetTime);
+		if (!seconds || usedPercent === undefined || resetAt === undefined || resetAt <= fetchedAt) continue;
+		const key = seconds === 5 * 3600 ? "primary" : "secondary";
+		// Duplicate windows cannot make a depleted account appear healthier.
+		if (!snapshot[key] || usedPercent > snapshot[key]!.usedPercent)
+			snapshot[key] = { usedPercent, resetAt, windowSeconds: seconds };
+	}
+	return snapshot.primary || snapshot.secondary ? snapshot : undefined;
+}
+
+async function fetchZaiCodingCnUsageSnapshot(
+	provider: string, credential: UsageCredential,
+	options: { fetchImpl?: typeof fetch; timeoutMs?: number; credentialHash?: string },
+): Promise<UsageSnapshot> {
+	if (credential.type !== "api_key" || !credential.key) throw new UsageFetchError(`${provider} has no Coding Plan API key`);
+	try {
+		const response = await (options.fetchImpl ?? fetch)(ZAI_CODING_CN_USAGE_URL, {
+			headers: { Authorization: credential.key, Accept: "application/json" },
+			redirect: "error",
+			signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
+		});
+		if (!response.ok) throw new UsageFetchError(`${provider} usage endpoint returned HTTP ${response.status}`, response.status);
+		const snapshot = parseZaiCodingCnUsageBody(provider, await response.json(), Date.now(), options.credentialHash);
+		if (!snapshot) throw new UsageFetchError(`${provider} usage endpoint returned no current quota window`);
+		return snapshot;
+	} catch (error) {
+		if (error instanceof UsageFetchError) throw error;
+		// Never echo provider bodies or fetch errors that could embed a credential.
+		throw new UsageFetchError(`${provider} usage request failed or timed out`);
+	}
+}
+
 export async function fetchUsageSnapshot(
 	provider: string,
 	credential: UsageCredential,
@@ -847,6 +898,7 @@ export async function fetchUsageSnapshot(
 		};
 	}
 	if (family === "xai") return fetchXaiUsageSnapshot(provider, credential, options);
+	if (family === "zai-coding-cn") return fetchZaiCodingCnUsageSnapshot(provider, credential, options);
 	if (credential.type !== "oauth" || !credential.access) {
 		throw new UsageFetchError(`${provider} has no OAuth access token`);
 	}
@@ -899,6 +951,7 @@ export function providerUsageLabel(provider: string): string {
 	if (provider.startsWith("cursor")) return index ? `Cursor A${index}` : "Cursor";
 	if (provider.startsWith("kimi-coding")) return index ? `Kimi A${index}` : "Kimi";
 	if (provider.startsWith("xai")) return index ? `xAI A${index}` : "xAI";
+	if (provider.startsWith("zai-coding-cn")) return index ? `GLM CN A${index}` : "GLM CN";
 	if (provider.startsWith("alibaba") || /^qwen/i.test(provider)) return index ? `Qwen A${index}` : "Qwen/Alibaba";
 	return provider;
 }

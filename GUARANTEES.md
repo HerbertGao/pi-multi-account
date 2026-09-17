@@ -84,6 +84,13 @@ test, not a one-off patch.
 
 | 60 | **A completed native Cursor shell cannot leave its exec stream open.** Stdout and exit (or rejection) are followed by exactly one `ExecClientStreamClose` with the original RPC id; Cursor can then produce its next tokens and finish. Heartbeats are not a substitute for this completion signal. | `native shell success, failure and rejection close the exec stream so Cursor can continue` (`test/cursor-shell-stream.test.ts`) |
 
+| 61 | **Pi session selections are not global account telemetry.** Native session model/thinking state wins over shared legacy preferences on startup, input and shutdown. | `native session model ignores shared preferences on startup, prompts and shutdown` · `test/session-ownership.test.ts` (real Pi SDK) |
+| 62 | **In-process subagents cannot acquire the live root's routing ownership.** Child teardown does not release the root lease; root shutdown does, so reload remains functional. | `in-process child activations are passive and root reload reacquires ownership` · `test/session-ownership.test.ts` |
+| 63 | **A manual model selection adopts its native thinking default in auto mode.** Explicit CLI thinking and forced configuration still win; automatic failover preserves intent. | `manual model selection adopts host per-model thinking defaults in auto mode` · real Pi SDK per-model defaults test |
+| 64 | **Small new tool results do not repeatedly rewrite a guarded request's cached prefix.** Reapply existing stubs, then cross the soft threshold before adding another batch. | `context guard preserves the serialized prefix until the outgoing request crosses the soft line again` |
+| 65 | **Concurrent Codex refreshers adopt one persisted winner without exposing shadowed OAuth.** Exchange and sidecar persistence share Pi's credential lock. | `two OS processes serialize a shadowed Codex refresh through the production sidecar` |
+| 66 | **Quota is provider evidence, not an invented default.** GLM CN ignores MCP limits, stale/invalid windows and failed responses; xAI missing percentage remains unknown. | `test/zai-usage.test.ts` · `xAI treats an omitted modern percentage as unknown even for a valid period` |
+
 ## How to keep this honest
 
 - **Every bug fix adds a row here and a test.** A fix without a locking test is not done.

@@ -23,7 +23,7 @@ import test from "node:test";
 import { VERSION as PI_HOST_VERSION } from "@earendil-works/pi-coding-agent";
 import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
 import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
-import { XAI_SUBSCRIPTION_USAGE_URL } from "../usage.ts";
+import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
@@ -9516,6 +9516,28 @@ test("an account with a usage endpoint still honours the recheck ceiling", async
 		minutes <= 11,
 		`a cheaply re-probed account must still come back at the ceiling; got ${minutes}m`,
 	);
+});
+
+test("accounts refresh fetches GLM CN API-key quota even with the footer disabled", async () => {
+	const t = setup({ accounts: { "zai-coding-cn": { type: "api_key", key: "cn-fixture-key" } },
+		current: { provider: "zai-coding-cn", id: "glm-test" }, config: { showUsage: false } });
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = (async (url: any, options: any) => {
+		assert.equal(String(url), ZAI_CODING_CN_USAGE_URL);
+		assert.equal(new Headers(options.headers).get("Authorization"), "cn-fixture-key");
+		calls++;
+		return Response.json({ data: { level: "pro", limits: [
+			{ type: "CREDIT_LIMIT", unit: 3, number: 5, percentage: 25, nextResetTime: Date.now() + 3_600_000 },
+		] } });
+	}) as typeof fetch;
+	try {
+		await t.fire("session_start");
+		await t.command("accounts refresh");
+		assert.ok(calls > 0);
+		assert.ok(t.rec.notifies.some((text) => text.includes("75%")), t.rec.notifies.join("\n"));
+		assert.deepEqual(t.rec.setModels, []);
+	} finally { await t.fire("session_shutdown"); globalThis.fetch = originalFetch; }
 });
 
 test("xAI cooldowns honour the cheap usage-probe recheck ceiling", async () => {

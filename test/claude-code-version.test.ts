@@ -43,7 +43,7 @@ test("the version-check workflow can still find the constant it is supposed to e
 	);
 });
 
-test("the workflow's sed actually rewrites the constant", () => {
+test("the maintainer bump can unambiguously rewrite the constant", () => {
 	// Same substitution the workflow performs, applied here so a reformatted constant (extra
 	// spaces, single quotes, a `satisfies` suffix) fails in CI instead of on a Monday at 09:00 UTC.
 	const bumped = indexSource.replace(
@@ -74,12 +74,8 @@ test("the version check never again depends on GitHub Actions opening a pull req
 		!/gh pr create/.test(executable),
 		"this repo forbids Actions from creating PRs — that call fails every run and strands a branch",
 	);
-	assert.ok(
-		executable.includes("git push origin HEAD:main"),
-		"the bump must land on main directly",
-	);
-	assert.ok(
-		/gh issue create/.test(executable),
-		"a refused push must surface as an issue, not a silently red scheduled run",
-	);
+	assert.ok(!executable.includes("git push"), "version checks must respect protected main");
+	assert.ok(/gh issue create/.test(executable), "new drift needs an actionable tracker");
+	assert.ok(/gh issue edit/.test(executable), "recurring drift must update the existing tracker");
+	assert.ok(/gh issue list/.test(executable), "look for an existing tracker before creating one");
 });

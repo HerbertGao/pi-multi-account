@@ -5,16 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.22.0] — 2026-09-16
+## [1.22.0] — 2026-09-17
+
+### Compatibility
+
+- Requires Agent Pi ≥0.85.1; release tests now install that supported host version. No host runtime upgrade is performed by this extension.
 
 ### Added
 
+- GLM Coding Plan CN quota for `zai-coding-cn`: explicit 5-hour/weekly credit windows, plan and reset metadata, fixed HTTPS endpoint and raw API-key authentication. Unknown, expired or malformed telemetry never invents available quota (#58).
 - SuperGrok / xAI OAuth subscription billing usage in the footer and limits command (PR #53). API-key usage remains unknown; private endpoint schema is best-effort.
 
-- **Background completions now route through Agent Pi, not through another extension.** On Pi 0.85.1 or newer, Multi Account registers one credentialless `registerCompletionRouter` implementation. Hermes and other callers use `ctx.requestCompletion`; this extension sees only operation IDs, model identities, and provider-owned attempt facts. Quota/auth/model/transport failures share cooldown state with foreground routing, but the operation-local lease never calls `pi.setModel` or queues a continuation. Route selection now records `completion_route_select` / `completion_route_unusable` in the debug log so a skipped session route is inspectable without coupling to the caller.
+- **Background completions now route through Agent Pi, not through another extension.** On hosts exposing the optional `registerCompletionRouter` API, Multi Account registers one credentialless implementation. Stock Pi 0.85.1 lacks this capability; the integration safely stays inactive there. Hermes and other callers use `ctx.requestCompletion`; this extension sees only operation IDs, model identities, and provider-owned attempt facts. Quota/auth/model/transport failures share cooldown state with foreground routing, but the operation-local lease never calls `pi.setModel` or queues a continuation. Route selection now records `completion_route_select` / `completion_route_unusable` in the debug log so a skipped session route is inspectable without coupling to the caller.
 
 ### Fixed
 
+- Session model ownership follows Pi's native session branch rather than shared legacy preferences. Another pane's telemetry writes cannot undo a live `/model` choice, and concurrent in-process subagents keep their launch model. Root activation ownership is released on shutdown, preserving `/reload` and session replacement (#51, #60).
+- Manual model switches in auto reasoning mode adopt Pi's per-model thinking default. Automatic failover still preserves effort intent; explicit CLI thinking and forced configuration remain authoritative (#59).
+- Context guard adds elisions based on the already-trimmed outgoing request with soft/target hysteresis. Growing raw history still requests compaction, but small new tool results no longer repeatedly invalidate the cached conversation prefix. Documentation now accounts for Pi's native between-tool compaction (#54).
+- Claude Code billing-header version updated to 2.1.274. Weekly checks maintain one drift issue without forbidden direct pushes or duplicate alerts (#52, #57).
+- xAI quota parsing treats missing or malformed percentages as unknown instead of manufacturing 100% headroom.
 - Codex forced refresh now holds Pi's cross-process credential lock through token exchange and persistence. Concurrent Pi processes adopt the winner's rotated credential instead of reusing the one-use refresh token and forcing another login. Numbered slots update their parent-only OAuth sidecar without exposing credentials in child-facing `auth.json`.
 - Codex now recognizes `refresh_token_reused` as a refresh-rotation error and checks for a newer credential already written by another process.
 
