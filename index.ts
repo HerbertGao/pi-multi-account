@@ -73,6 +73,7 @@ import {
 import {
 	applyRestoreAll,
 	applyShadowAll,
+	isChildFacingPlaceholderForSlot,
 	mergeParentAuth,
 	needsAuthShadow,
 } from "./slot-proxy-auth.ts";
@@ -447,7 +448,6 @@ function piAiGetModel(provider: string, id: string): any {
 }
 import {
 	CodexCatalogFetchError,
-	OllamaCatalogFetchError,
 	compareCodexModelStrength,
 	fetchCodexModelCatalog,
 	fetchOllamaCloudCatalog,
@@ -1160,7 +1160,6 @@ const AUTH_CHANGE_POLL_MS = 5000;
 // earlier than its recorded estimate (or a fresh /login in a parallel session); polling lets the
 // first account that is ACTUALLY free pick the work back up.
 const PENDING_POLL_MS = 60 * 1000;
-const MAX_QUEUED_USER_INPUTS = 20;
 // A held user message is only worth delaying a compaction for if it is about to be sent.
 const QUEUE_FLUSH_SOON_MS = 10 * 1000;
 // Runaway-loop guards (added). Without these, when every account is rate-limited the
@@ -1433,7 +1432,11 @@ const FORCE_REFRESH_AUTH_ERROR_PATTERNS = [
 // v1.9.0 — OpenAI Codex returns them transiently under load even when the account is alive
 // (a parallel Pi session can refresh the same token moments later). They are now treated as
 // transient: the account gets a short cooldown and the next attempt can still refresh.
-const TERMINAL_REFRESH_ERROR_PATTERNS = ["invalid_grant", "revoked"];
+const TERMINAL_REFRESH_ERROR_PATTERNS = [
+	"invalid_grant",
+	"refresh_token_reused",
+	"revoked",
+];
 
 const DEFAULT_IGNORE_PATTERNS = [
 	"context overflow",
@@ -1859,11 +1862,6 @@ function stringArray(value: unknown): string[] {
 		.filter((item) => item.length > 0);
 }
 
-function nonEmptyStringArrayOr(value: unknown, fallback: string[]): string[] {
-	const sanitized = stringArray(value);
-	return sanitized.length > 0 ? sanitized : fallback;
-}
-
 /**
  * The error vocabulary is a dictionary that GROWS with each release, so a user's list is merged
  * with the built-in one rather than replacing it.
@@ -2176,7 +2174,7 @@ function readAuthFileRaw(): Record<string, AuthEntry> {
 	}
 }
 
-function readProxyOAuthSidecar(): Record<string, AuthEntry> {
+export function readProxyOAuthSidecar(): Record<string, AuthEntry> {
 	try {
 		return JSON.parse(readFileSync(PROXY_OAUTH_PATH, "utf8")) as Record<
 			string,
@@ -2187,7 +2185,7 @@ function readProxyOAuthSidecar(): Record<string, AuthEntry> {
 	}
 }
 
-function writeProxyOAuthSidecar(data: Record<string, AuthEntry>): void {
+export function writeProxyOAuthSidecar(data: Record<string, AuthEntry>): void {
 	const tmp = `${PROXY_OAUTH_PATH}.multi-account.tmp`;
 	writeFileSync(tmp, `${JSON.stringify(data, null, "\t")}\n`, {
 		encoding: "utf8",
@@ -2826,11 +2824,11 @@ export function mergeRefreshedCredentials(credentials: any, refreshed: any) {
  * dropped from the rotation with a demand to re-login that fixed nothing: the working token had
  * been on disk the whole time, written by whoever won the race.
  *
- * So on `invalid_grant` — and only on `invalid_grant` — we re-read what is stored now and try
- * once more. If disk holds the same token that just failed there is nothing new to send, and the
- * account really is revoked: fail immediately so rotation moves on. Any other error (a timeout, a
- * 5xx) is not a statement about the token and is never retried, since burning the disk token on a
- * network blip would turn an outage into a lost account.
+ * So on a provider verdict that the refresh token was already spent (`invalid_grant` or Codex's
+ * `refresh_token_reused`) we re-read what is stored now and try once more. If disk holds the same
+ * token that just failed there is nothing new to send, and the account really needs a new login.
+ * Any other error (a timeout or 5xx) is not a statement about the token and is never retried, since
+ * burning the disk token on a network blip would turn an outage into a lost account.
  *
  * Exported for tests: this is the one piece of logic that decides whether an account survives.
  */
@@ -2842,11 +2840,86 @@ export async function refreshWithDiskRetry(opts: {
 	try {
 		return await opts.refresh(opts.credentials);
 	} catch (error) {
-		if (!/invalid_grant/i.test(String((error as any)?.message ?? error))) throw error;
+		const message = String((error as any)?.message ?? error);
+		if (!/invalid_grant|refresh_token_reused/i.test(message)) throw error;
 		const stored = opts.storedRefresh();
 		if (!stored || stored === opts.credentials?.refresh) throw error;
 		return await opts.refresh({ ...opts.credentials, refresh: stored });
 	}
+}
+
+function oauthCredentialChanged(before: any, after: any): boolean {
+	return (
+		before?.access !== after?.access ||
+		before?.refresh !== after?.refresh ||
+		before?.expires !== after?.expires ||
+		before?.accountId !== after?.accountId
+	);
+}
+
+/**
+ * Serialize a refresh through Pi's cross-process AuthStorage lock.
+ *
+ * The authoritative credential is read only after the lock is held. A waiter that observes a
+ * credential written by the winner adopts it instead of spending the same one-use refresh token.
+ * Shadowed slots persist into the parent-only sidecar while leaving the child-facing placeholder
+ * untouched; both files are protected by the same auth.json lock.
+ */
+export async function refreshAndPersistWithStorageLock(opts: {
+	provider: string;
+	credentials: any;
+	authStorage: any;
+	readLatest: () => any;
+	refresh: (credentials: any) => Promise<any>;
+	isShadowed?: (stored: any) => boolean;
+	persistShadowed?: (credential: any) => void;
+	signal?: AbortSignal;
+}): Promise<any> {
+	if (typeof opts.authStorage?.modify !== "function") {
+		throw new Error("OAuth refresh storage does not provide a cross-process modify lock");
+	}
+
+	let resolved: any;
+	await opts.authStorage.modify(
+		opts.provider,
+		async (stored: any) => {
+			const latest = opts.readLatest();
+			if (
+				latest?.type !== "oauth" ||
+				typeof latest.access !== "string" ||
+				typeof latest.refresh !== "string"
+			) {
+				throw new Error(`No refreshable OAuth credential remains for ${opts.provider}`);
+			}
+
+			if (oauthCredentialChanged(opts.credentials, latest)) {
+				resolved = latest;
+				return undefined;
+			}
+
+			resolved = await opts.refresh(latest);
+			if (
+				resolved?.type !== "oauth" ||
+				typeof resolved.access !== "string" ||
+				typeof resolved.refresh !== "string"
+			) {
+				throw new Error(`OAuth refresh returned no usable credential for ${opts.provider}`);
+			}
+
+			if (opts.isShadowed?.(stored)) {
+				if (!opts.persistShadowed) {
+					throw new Error(`No sidecar persistence path exists for ${opts.provider}`);
+				}
+				opts.persistShadowed(resolved);
+				return undefined;
+			}
+			return resolved;
+		},
+		{ signal: opts.signal },
+	);
+
+	if (!resolved) throw new Error(`OAuth refresh produced no credential for ${opts.provider}`);
+	return resolved;
 }
 
 /** The refresh token currently stored on disk for a slot — whoever wrote it last wins. */
@@ -2929,7 +3002,12 @@ function codexOAuthOverride(providerId: string, name: string) {
 			return rejectDuplicateLogin(providerId, await getProvider().login(callbacks));
 		},
 		async refreshToken(credentials: any, signal?: AbortSignal) {
-			return getProvider().refresh(credentials, oauthRefreshSignal(signal));
+			return refreshWithDiskRetry({
+				credentials,
+				refresh: (current) =>
+					getProvider().refresh(current, oauthRefreshSignal(signal)),
+				storedRefresh: () => storedRefreshToken(providerId),
+			});
 		},
 		getApiKey(credentials: any) {
 			return getProvider().getApiKey(credentials);
@@ -3051,13 +3129,6 @@ function registerKimiSlot(
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1";
 
-// Ollama Cloud accepts both the canonical bare id (`kimi-k3`, `glm-5.2`) returned by
-// /v1/models and the legacy `:cloud`-suffixed form, so the suffix is display-only now.
-// Every managed Ollama provider (base + cloned slots) is registered against the Cloud
-// endpoint, so all of its models route there regardless of suffix.
-function isOllamaCloudModel(modelId: string): boolean {
-	return modelId.includes(":cloud");
-}
 const OLLAMA_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 	"glm-5.2:cloud": {
 		id: "glm-5.2:cloud",
@@ -3867,7 +3938,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	};
 	/** Settles once Cursor fallback models are registered. Pi awaits the factory return, so createAgentSession can getModel(cursor, grok-4.6) instead of falling back. */
 	let cursorReady: Promise<unknown> | undefined;
-	let modelCatalogContext: any;
 
 	// ----- only-active model filter -------------------------------------------
 	// When enabled, /model drops this extension's OTHER rotation slots: each is
@@ -3888,15 +3958,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let onlyActiveModels = config.onlyActive;
 	/** Models of the providers WE hid, freshest copy — the only way back. */
 	const hiddenProviderModels = new Map<string, any[]>();
-
-	/**
-	 * A provider that exists ONLY because this extension registered it. Pi has no
-	 * built-in and no models.json entry under a `-account-N` name unless we made it,
-	 * so narrowing these takes nothing away from anyone else.
-	 */
-	function isOwnRotationSlot(provider: string): boolean {
-		return /-account-\d+$/.test(provider);
-	}
 
 	function unhideProvider(provider: string) {
 		const models = hiddenProviderModels.get(provider);
@@ -3933,7 +3994,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let internalModelChanges = 0;
 	async function setModelEnsuringVisible(
 		target: { provider: string; id: string },
-		ctx: any,
+		_ctx: any,
 	) {
 		if (onlyActiveModels) unhideProvider(target.provider);
 		// Pi <=0.84.2 rewrites the saved global default on this path. Pi >=0.84.3 keeps
@@ -4748,6 +4809,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const family = classifyProvider(provider, config.qwenProvider);
 		try {
 			let refreshed: AuthEntry | undefined;
+			let persistedUnderLock = false;
 			if (family === "anthropic") {
 				refreshed = await refreshAnthropicCredentials(
 					entry,
@@ -4755,13 +4817,43 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					provider,
 				);
 			} else if (family === "openai-codex") {
-				refreshed = mergeRefreshedCredentials(
-					entry,
-					await requirePiAiOauth().codex.refresh(
-						entry as any,
-						AbortSignal.timeout(30_000),
-					),
-				);
+				const refreshCodex = async (current: AuthEntry) => {
+					const next = mergeRefreshedCredentials(
+						current,
+						await requirePiAiOauth().codex.refresh(
+							current as any,
+							AbortSignal.timeout(30_000),
+						),
+					) as AuthEntry;
+					if (
+						current.accountId &&
+						next.accountId &&
+						current.accountId !== next.accountId
+					) {
+						throw new Error("OAuth refresh returned credentials for a different account");
+					}
+					return next;
+				};
+
+				if (typeof authStorage?.modify === "function") {
+					refreshed = await refreshAndPersistWithStorageLock({
+						provider,
+						credentials: entry,
+						authStorage,
+						readLatest: () => readAuthFile()[provider],
+						refresh: refreshCodex,
+						isShadowed: (stored) =>
+							isChildFacingPlaceholderForSlot(stored, provider),
+						persistShadowed: (credential) =>
+							writeProxyOAuthSidecar({
+								...readProxyOAuthSidecar(),
+								[provider]: credential,
+							}),
+					});
+					persistedUnderLock = true;
+				} else {
+					refreshed = await refreshCodex(entry);
+				}
 			} else if (family === "cursor") {
 				refreshed = mergeRefreshedCredentials(
 					entry,
@@ -4788,11 +4880,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				};
 			}
 
-			const persisted = await persistRefreshedCredentials(authStorage, provider, {
-				type: "oauth",
-				...entry,
-				...refreshed,
-			});
+			const persisted =
+				persistedUnderLock ||
+				(await persistRefreshedCredentials(authStorage, provider, {
+					type: "oauth",
+					...entry,
+					...refreshed,
+				}));
 			if (!persisted) {
 				// The refresh already rotated the token server-side, so the old one on
 				// disk is dead either way. Say so instead of pretending it is transient.
@@ -8673,25 +8767,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		await attemptQueuedInputResume(ctx);
 	}
 
-	function queueUserInput(ctx: any, text: string, images?: any[]) {
-		if (queuedUserInputs.length >= MAX_QUEUED_USER_INPUTS) {
-			ctx.ui.notify(
-				`Provider failover: the automatic wait queue is full (${MAX_QUEUED_USER_INPUTS}); use /multi-account stop before retrying.`,
-				"error",
-			);
-			return;
-		}
-		queuedUserInputs.push({ text, images });
-		logEvent("queued_input_held", { count: queuedUserInputs.length });
-		const delay = nextModelAvailabilityDelayMs(ctx);
-		if (delay === undefined) return;
-		scheduleQueuedInputWake(ctx);
-		ctx.ui.notify(
-			`Provider failover: all usable accounts are cooling down. Your message is held in memory and will be sent automatically in ~${formatDelay(delay)}; /multi-account stop cancels it.`,
-			"warning",
-		);
-	}
-
 	// ----- error classification --------------------------------------------
 
 	function isAuthError(text: string) {
@@ -10903,7 +10978,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		lastObservedModelKey = thinkingModelKey(ctx);
 		lastObservedThinkingLevel = readThinkingLevel();
 		pendingModelThinkingChange = undefined;
-		modelCatalogContext = ctx;
 		if (!explicitCliThinkingLevel) {
 			const resolved = await resolveExplicitCliModelThinkingLevel(
 				explicitCliArgs,
@@ -11008,7 +11082,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (activations[activationKey] === activationOwner) delete activations[activationKey];
 		sessionClosed = true;
 		completionRouterContext = undefined;
-		modelCatalogContext = undefined;
 		rememberUserModel(ctx?.model);
 		if (pendingWakeTimer) {
 			clearTimeout(pendingWakeTimer);

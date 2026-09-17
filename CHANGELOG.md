@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex forced refresh now holds Pi's cross-process credential lock through token exchange and persistence. Concurrent Pi processes adopt the winner's rotated credential instead of reusing the one-use refresh token and forcing another login. Numbered slots update their parent-only OAuth sidecar without exposing credentials in child-facing `auth.json`.
+- Codex now recognizes `refresh_token_reused` as a refresh-rotation error and checks for a newer credential already written by another process.
+
 - **Cursor turns now complete the way every other provider does.** Cursor often sends `turnEnded` and then keeps the gRPC Run open; the proxy treated that as "still Working" until the TCP stream happened to close. The OpenAI stream now finishes with `stop` on `turnEnded` (or pauses on a Pi-bound tool call), matching Codex/Claude/Kimi.
 - **Cursor transport liveness and model progress now use separate clocks.** A minute with no complete upstream frame restarts a dead Run quickly. Heartbeats and other decoded housekeeping prove the HTTP/2 transport is alive, while only visible tokens and Pi-bound tools reset the longer five-minute useful-output bound; live long-reasoning Runs are no longer killed after one quiet minute.
 - **Cursor native tools (`read` / `write` / `grep` / `ls` / `shell`) are forwarded onto Pi's MCP tools** instead of being rejected in a loop that never becomes a `tool_calls` pause. Results are written back in Cursor's native result shape so the Run can continue.
