@@ -105,7 +105,6 @@ test("Pi's post-compaction event resets the Cursor conversation for that session
 	registerSessionLifecycleHooks(pi, {
 		cleanupSessionState: () => {},
 		resetConversationForSession: (sessionId) => reset.push(sessionId),
-		stopProxy: () => {},
 	});
 
 	const handler = handlers.get("session_compact");
@@ -127,12 +126,27 @@ test("session cleanup still tears the session down and never resets it as a comp
 	registerSessionLifecycleHooks(pi, {
 		cleanupSessionState: (sessionId) => cleaned.push(sessionId),
 		resetConversationForSession: (sessionId) => reset.push(sessionId),
-		stopProxy: () => {},
 	});
 	handlers.get("session_before_switch")?.({}, ctx);
 
 	assert.deepEqual(cleaned, ["gone"]);
 	assert.deepEqual(reset, [], "a switched-away session is cleaned, not recycled");
+});
+
+test("session shutdown only cleans session state; the process-scoped proxy survives /new", () => {
+	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	const cleaned: string[] = [];
+	const pi = {
+		on: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler),
+	} as never;
+	const ctx = { sessionManager: { getSessionId: () => "old-session" } };
+
+	registerSessionLifecycleHooks(pi, {
+		cleanupSessionState: (sessionId) => cleaned.push(sessionId),
+	});
+	handlers.get("session_shutdown")?.({}, ctx);
+
+	assert.deepEqual(cleaned, ["old-session"]);
 });
 
 test("a compaction that lost its history keeps the previous summary instead of 'No prior history.'", () => {

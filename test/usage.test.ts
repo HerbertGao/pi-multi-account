@@ -6,8 +6,11 @@ import {
 	parseAnthropicUsageBody,
 	parseCodexUsageBody,
 	parseCodexUsageHeaders,
+	parseCursorCurrentPeriodUsage,
+	parseCursorSandUsage,
 	parseOllamaMeBody,
 	parseOllamaUsageBody,
+	UsageFetchError,
 } from "../usage.ts";
 
 const NOW = Date.UTC(2026, 5, 13, 12, 0, 0);
@@ -392,5 +395,112 @@ test("a blocked account still reads as blocked", () => {
 		formatUsageCompact(snapshot!, now),
 		/spent|blocked|✗/i,
 		"the negative verdict must be just as visible",
+	);
+});
+
+test("Cursor's three Pro+ pools arrive as three labelled windows and never leak the token", async () => {
+	// Verified live 2026-09-12: aiserver.v1.DashboardService answers both methods for the same
+	// OAuth session token the bridge already holds, and the numbers match Cursor's dashboard
+	// exactly (included models 97%, other models 35%, Grok Bot weekly 0%). Before this, the
+	// extension honestly reported "subscription" because no quota API was known.
+	const calls: Array<{ url: string; authorization: string | null; connect: string | null }> = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const headers = new Headers(init?.headers);
+		const url = String(input);
+		calls.push({
+			url,
+			authorization: headers.get("authorization"),
+			connect: headers.get("connect-protocol-version"),
+		});
+		return url.endsWith("/GetCurrentPeriodUsage")
+			? new Response(
+					JSON.stringify({
+						billingCycleStart: "1787120231000",
+						billingCycleEnd: "1789798631000",
+						planUsage: { autoPercentUsed: 97.32, apiPercentUsed: 35.18 },
+					}),
+					{ status: 200 },
+				)
+			: new Response(
+					JSON.stringify({
+						currentPeriodStart: "2026-09-09T21:00:13.847Z",
+						nextResetTimestampUtc: "2026-09-16T21:00:13.847Z",
+						usagePercent: 0,
+						cursorPlanName: "Pro",
+					}),
+					{ status: 200 },
+				);
+	}) as typeof fetch;
+
+	const snapshot = await fetchUsageSnapshot(
+		"cursor",
+		{ type: "oauth", access: "secret-cursor-token" },
+		{ fetchImpl, credentialHash: "safe-hash" },
+	);
+	assert.deepEqual(
+		calls.map((call) => call.url),
+		[
+			"https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+			"https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus",
+		],
+	);
+	assert.equal(calls[0]?.authorization, "Bearer secret-cursor-token");
+	assert.equal(calls[0]?.connect, "1");
+	assert.equal(snapshot.plan, "Pro");
+	assert.equal(snapshot.credentialHash, "safe-hash");
+	assert.equal(snapshot.primary?.usedPercent, 97.32, "included models are the primary pool");
+	assert.equal(snapshot.secondary?.usedPercent, 35.18, "third-party models are the secondary pool");
+	assert.equal(snapshot.secondary?.resetAt, 1_789_798_631_000);
+	assert.equal(snapshot.tertiary?.usedPercent, 0, "Grok Bot is the extra weekly pool");
+	assert.equal(snapshot.tertiary?.resetAt, Date.parse("2026-09-16T21:00:13.847Z"));
+	const footer = formatUsageCompact(snapshot, NOW);
+	assert.match(footer, /^Cursor \| Pro \| models 3% left\//, footer);
+	assert.match(footer, /other 65% left\//, footer);
+	assert.match(footer, /grok bot 100% left\//, footer);
+	assert.ok(
+		footer.indexOf("models") < footer.indexOf("other") && footer.indexOf("other") < footer.indexOf("grok bot"),
+		`pool order must follow primary/secondary/tertiary; footer: ${footer}`,
+	);
+	assert.ok(!JSON.stringify(snapshot).includes("secret-cursor-token"));
+});
+
+test("Cursor keeps the honest subscription snapshot when the undocumented rpc fails", async () => {
+	// The quota numbers are an enrichment on top of the old plan-only snapshot. A refusal must
+	// not blank the footer or report a working account as "usage unavailable".
+	const fetchImpl = (async () => new Response("unavailable", { status: 503 })) as typeof fetch;
+	const snapshot = await fetchUsageSnapshot(
+		"cursor",
+		{ type: "oauth", access: "secret" },
+		{ fetchImpl },
+	);
+	assert.equal(snapshot.plan, "subscription");
+	assert.equal(snapshot.primary, undefined, "no window may be invented");
+	assert.equal(snapshot.tertiary, undefined);
+	assert.equal(formatUsageCompact(snapshot), "Cursor | subscription");
+});
+
+test("a 401 from the dashboard service is surfaced so the OAuth refresh can retry", async () => {
+	const fetchImpl = (async () => new Response("{}", { status: 401 })) as typeof fetch;
+	await assert.rejects(
+		fetchUsageSnapshot("cursor", { type: "oauth", access: "secret" }, { fetchImpl }),
+		(error: unknown) => error instanceof UsageFetchError && error.status === 401,
+	);
+});
+
+test("Cursor parsers accept the snake_case wire shape and refuse to invent windows", () => {
+	const period = parseCursorCurrentPeriodUsage(
+		"cursor",
+		{ billing_cycle_end: "1789798631000", plan_usage: { auto_percent_used: 12, api_percent_used: 34 } },
+		NOW,
+		"hash",
+	);
+	assert.ok(period);
+	assert.equal(period.primary?.usedPercent, 12);
+	assert.equal(period.secondary?.usedPercent, 34);
+	assert.equal(parseCursorCurrentPeriodUsage("cursor", { plan_usage: {} }, NOW), undefined);
+	assert.equal(
+		parseCursorSandUsage({ usage_percent: 5 }),
+		undefined,
+		"a percent without a reset is not a window",
 	);
 });

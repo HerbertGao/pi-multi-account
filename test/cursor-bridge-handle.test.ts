@@ -74,6 +74,13 @@ test("ending twice is harmless", () => {
 	assert.equal(handle.alive, false);
 });
 
+test("destroying a cancelled bridge terminates its HTTP/2 subprocess", () => {
+	const { proc, handle } = makeBridge();
+	handle.destroy();
+	assert.equal(handle.alive, false);
+	assert.equal(proc.killed, true, "closing stdin alone leaves a streaming Cursor bridge alive");
+});
+
 test("a late write that slips past the guard still cannot become an uncaught exception", async () => {
 	const { proc } = makeBridge();
 	// Bypass the handle entirely and write straight into the ended pipe — the failure mode the

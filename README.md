@@ -11,7 +11,7 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 - **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi first tries another account with the same model. If it must leave the family, it preserves the model's quality band — Sol/Opus/other frontier flagships stay frontier; Terra/Sonnet stay balanced; Luna/Haiku stay fast — and keeps the session's thinking level. A fresh provider verdict of `blocked` or 100% is skipped automatically instead of wasting the turn; manual `next` remains an explicit one-attempt override for stale telemetry.
-- **Optional auto-continue**: resumes the interrupted turn after a switch from the last safe point. A transient 5xx/overload may retry the same provider/model once; a second consecutive failure moves through the same-model-first, same-quality failover ladder instead of starting another retry wave. Same-route retries are labelled as retries, not fake switches, and the breaker remains the final bound when alternatives also fail. A failed or cancelled automatic compaction still continues the task instead of leaving the session parked in Working.
+- **Optional auto-continue**: resumes the interrupted turn after a switch from the last safe point. Temporary 5xx/overload errors and Cursor stalls retry the exact selected provider/account/model, without marking its quota exhausted. After four failed attempts (or an earlier recovery breaker), automatic retries stop with an explicit explanation; temporary errors never authorize a switch. Same-route retries are labelled as retries, not fake switches. A failed or cancelled automatic compaction still continues the task instead of leaving the session parked in Working.
 - **Never hides a fresh user message in a private cooldown queue.** If no account is ready, the message remains in Pi's visible transcript and Pi owns its normal delivery/retry path.
 - **Session-bound overnight resume**: if every account is cooling down, the live Pi session waits for the earliest recovery and continues automatically. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
 - **Deduplicates provably identical accounts** so duplicate Codex workspace memberships and identical credentials do not consume multiple rotation slots or get separate cooldowns. Different users in one Team/Business workspace remain distinct. New provable duplicate logins are rejected before the redundant slot is saved.
@@ -40,7 +40,7 @@ and it says so at session start.
 
 ### Recommended setting
 
-Set Pi provider-level retries to zero so the SDK does not keep retrying an exhausted account before failover kicks in. Pi's separate agent-level retry loop may remain enabled: the extension allows one same-route transient retry, cancels its pending wake if that retry succeeds, and fails over if the route fails again. In `~/.pi/agent/settings.json`:
+Set Pi provider-level retries to zero so the SDK does not keep retrying an exhausted account before failover kicks in. Pi's separate agent-level retry loop may remain enabled: the extension cancels its pending wake if that retry succeeds. Repeated temporary failures get bounded recovery on the same route, then an explicit stop—not provider failover. In `~/.pi/agent/settings.json`:
 
 ```json
 { "retry": { "provider": { "maxRetries": 0 } } }
@@ -149,13 +149,19 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `compactionWatchdogMs` | 8 min | Upper bound for one routed compaction attempt. A timed-out attempt is aborted and the next live account is tried. |
 | `resumeIdleTimeoutMs` | 90 s | Max time to wait for the previous turn to go idle before a resume gives up and retries later (never an unbounded loop). |
 | `stuckWatchdogMs` | 180 s | A resumed turn silent for this long (with no tool running) is treated as wedged. |
-| `autoRecoverStuck` | `true` | When a resume wedges, auto-cancel it and auto-resume when an account frees, instead of only notifying. Set `false` for notify-only. |
+| `autoRecoverStuck` | `true` | When a resume wedges, auto-cancel it and retry the same provider/model within the shared recovery budget, instead of only notifying. Set `false` for notify-only. |
 | `debugLog` | `true` | Write a structured "black box" decision log to `provider-failover-debug.log` (no credentials — only provider/model ids and truncated reasons). View with `/multi-account log`. |
 | `preferLatestModel` | `true` | Rank the strongest/current model ahead of older siblings within the current quality band during automatic failover. |
 | `reasoningLevel` | `"auto"` | `"auto"` follows the level the session actually runs at (your Pi default, `/thinking`, per-agent `--thinking`) and only restores it after switches. Set an explicit level (`"off"`…`"xhigh"`) to **force** it on every turn regardless of the session — `"xhigh"` only if you really want the extreme level. |
 | `preferredModels` | `{}` | Optional manual strongest-first override per family; when present it wins over live catalog priority. |
 
 State (cooldowns, invalidations, recent switches, credential-free Codex model catalogs, and a diagnostic pending marker) is persisted to `~/.pi/agent/provider-failover-state.json`. The actual pending task is session-local: one Pi window never consumes or resumes another window's work. Pending work is discarded when its owning session closes.
+
+### Host-owned background completions
+
+On Agent Pi 0.85.1 or newer, Multi Account registers one credentialless completion router with the host. Extensions can request isolated background completions through Pi without importing or calling Multi Account. The router sees operation IDs, model identities, attempt outcomes, and provider response facts only; prompts and credentials remain inside the host.
+
+Background attempts share the same cooldown and invalidation state as foreground routing. Quota, authentication, model, and transport failures can select a healthy fallback; parser and consumer failures do not affect route health. The route lease is operation-local: it never calls `pi.setModel`, queues a continuation, or changes the user's selected foreground model.
 
 ### pi-subagents and delegation-broker compatibility
 
@@ -169,8 +175,8 @@ A failover is only useful if the agent actually keeps working afterward. These g
 
 - **Compaction survives account limits — and never leaves the spinner running.** When your context fills up and the active account is rate-limited, the summary is generated on a *healthy* account. If that attempt times out it is aborted (not leaked) and the next live account is tried. If none can finish, compaction is cancelled so "Compacting context…" stops; Pi's default is never given a spent account.
 - **Resumes only happen when there is something to resume.** The extension continues a turn only when it actually ended in an error it can pick up from — it never tries to "continue" a finished reply (the cause of the cryptic `Cannot continue from message role: assistant` error).
-- **A forward-progress watchdog that acts.** If a resumed turn goes completely silent (no streaming, no tool activity, no provider response) and no tool is running, the extension auto-cancels the wedged turn and resumes the work itself when an account frees up — you do not have to press Esc or re-type the prompt. A long, silent build/test command is never mistaken for a wedge.
-- **A circuit breaker as the floor.** If automatic recovery keeps failing, the extension drops to *advisory mode*: it still flags limits and switches you to a fresh account, but stops the auto-continue that was failing, so a bad state can never spiral into repeated hangs. It re-enables itself on the next success, a new prompt, or `/multi-account reset`.
+- **A forward-progress watchdog that acts.** If a resumed turn goes completely silent (no streaming, no tool activity, no provider response) and no tool is running, the extension auto-cancels the wedged turn and retries the same provider/model within the recovery budget — you do not have to press Esc or re-type the prompt. A long, silent build/test command is never mistaken for a wedge.
+- **A circuit breaker as the floor.** If automatic recovery keeps failing, the extension drops to *advisory mode*: confirmed quota limits can still select a fresh account, but temporary errors preserve the selected route and stop the auto-continue that was failing, so a bad state can never spiral into repeated hangs. It re-enables itself on the next success, a new prompt, or `/multi-account reset`.
 - **A black box for diagnosis.** Every decision (switch, error and how it was classified, watchdog action, breaker trip, compaction routing) is appended to `~/.pi/agent/provider-failover-debug.log`. If anything misbehaves, run `/multi-account log` — the exact sequence is there, so a bug can be reproduced and fixed instead of guessed at. The file is bounded in size and redacts token-shaped material; review private project details before sharing it.
 
 ## Privacy & security

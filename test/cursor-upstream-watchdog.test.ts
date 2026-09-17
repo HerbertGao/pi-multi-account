@@ -2,17 +2,18 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import test from "node:test";
 import {
+  TRANSPORT_STALL_TIMEOUT_MS,
   UPSTREAM_STALL_TIMEOUT_MS,
   formatStallDuration,
+  resolveTransportStallTimeoutMs,
   resolveUpstreamStallTimeoutMs,
   startUpstreamWatchdog,
 } from "../cursor/upstream-watchdog.ts";
 
 /**
  * With SSE keepalives holding the client connection open, the only thing that can end a turn
- * Cursor has silently abandoned is our own view of upstream progress. These tests pin that
- * watchdog: it fires once after a quiet period, observed progress pushes it back, and closing
- * the response retires it.
+ * Cursor has silently abandoned is our own view of upstream progress. Visible tokens and
+ * Pi-bound tools push the deadline; heartbeat, checkpoints, and blob fetches do not.
  */
 
 function sleep(ms: number): Promise<void> {
@@ -57,11 +58,15 @@ test("a non-positive timeout disables the watchdog", async () => {
   watchdog.stop();
 });
 
-test("default timeout is five minutes and the env override is honoured", () => {
-  assert.equal(UPSTREAM_STALL_TIMEOUT_MS, 5 * 60_000);
+test("dead transport and live-but-unproductive Run have separate default bounds", () => {
+  assert.equal(TRANSPORT_STALL_TIMEOUT_MS, 60_000, "a connection emitting no frames is dead quickly");
+  assert.equal(UPSTREAM_STALL_TIMEOUT_MS, 5 * 60_000, "a live connection may legitimately spend more than a minute reasoning");
+  assert.equal(resolveTransportStallTimeoutMs({}), TRANSPORT_STALL_TIMEOUT_MS);
+  assert.equal(resolveTransportStallTimeoutMs({ PI_CURSOR_TRANSPORT_STALL_MS: "90000" }), 90_000);
+  assert.equal(resolveTransportStallTimeoutMs({ PI_CURSOR_TRANSPORT_STALL_MS: "0" }), 0, "0 disables transport watchdog");
   assert.equal(resolveUpstreamStallTimeoutMs({}), UPSTREAM_STALL_TIMEOUT_MS);
   assert.equal(resolveUpstreamStallTimeoutMs({ PI_CURSOR_UPSTREAM_STALL_MS: "120000" }), 120_000);
-  assert.equal(resolveUpstreamStallTimeoutMs({ PI_CURSOR_UPSTREAM_STALL_MS: "0" }), 0, "0 disables");
+  assert.equal(resolveUpstreamStallTimeoutMs({ PI_CURSOR_UPSTREAM_STALL_MS: "0" }), 0, "0 disables semantic watchdog");
   assert.equal(resolveUpstreamStallTimeoutMs({ PI_CURSOR_UPSTREAM_STALL_MS: "soon" }), UPSTREAM_STALL_TIMEOUT_MS, "garbage falls back");
   assert.equal(resolveUpstreamStallTimeoutMs({ PI_CURSOR_UPSTREAM_STALL_MS: "-5" }), UPSTREAM_STALL_TIMEOUT_MS, "negative falls back");
   assert.equal(resolveUpstreamStallTimeoutMs({ PI_CURSOR_UPSTREAM_STALL_MS: "0.5" }), UPSTREAM_STALL_TIMEOUT_MS, "fractions must not disable the watchdog");
@@ -78,7 +83,7 @@ test("stall durations read naturally in the error surfaced to the user", () => {
 });
 
 // Generated protobuf enums need transpilation; keep the test loader local to this subprocess.
-test("the proxy measures decoded progress rather than heartbeat or partial-frame traffic", () => {
+test("the proxy distinguishes dead transport from a live but unproductive Run", () => {
   execFileSync(process.execPath, ["--import", new URL("./fixtures/typescript-loader.mjs", import.meta.url).href, "--input-type=module", "-e", `
     import assert from "node:assert/strict";
     import { EventEmitter } from "node:events";
@@ -87,7 +92,8 @@ test("the proxy measures decoded progress rather than heartbeat or partial-frame
     import { AgentServerMessageSchema } from "./cursor/proto/agent_pb.ts";
     import { writeSSEStreamForTests } from "./cursor/proxy.ts";
 
-    process.env.PI_CURSOR_UPSTREAM_STALL_MS = "200";
+    process.env.PI_CURSOR_TRANSPORT_STALL_MS = "200";
+    process.env.PI_CURSOR_UPSTREAM_STALL_MS = "500";
     mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
     mock.method(performance, "now", () => Date.now());
     function frame(message) {
@@ -110,7 +116,7 @@ test("the proxy measures decoded progress rather than heartbeat or partial-frame
       });
       const bridge = {
         alive: true, proc: { kill() {} }, write() {},
-        end() { cancelled = true; },
+        end() { cancelled = true; }, destroy() { cancelled = true; },
         onData(callback) { receive = callback; }, onClose() {},
       };
       writeSSEStreamForTests({
@@ -124,14 +130,23 @@ test("the proxy measures decoded progress rather than heartbeat or partial-frame
     const thinking = frame({ case: "interactionUpdate", value: { message: { case: "thinkingDelta", value: { text: "thinking" } } } });
     try {
       const stalled = stream();
-      for (let i = 0; i < 10; i++) {
-        stalled.receive(heartbeat);
+      mock.timers.tick(250);
+      assert.equal(stalled.res.writableEnded, true, "a connection producing no complete frame must hit the transport bound");
+      assert.equal(stalled.cancelled(), true, "the stalled bridge must be cancelled");
+      assert.match(stalled.output(), /no upstream frames/);
+
+      const heartbeatOnly = stream();
+      for (let i = 0; i < 6; i++) {
+        heartbeatOnly.receive(heartbeat);
         mock.timers.tick(50);
       }
-      assert.equal(stalled.res.writableEnded, true, "heartbeat-only traffic must time out");
-      assert.equal(stalled.cancelled(), true, "the stalled bridge must be cancelled");
-      assert.match(stalled.output(), /stream timed out/);
-      assert.equal((stalled.output().match(/stream timed out/g) ?? []).length, 1);
+      assert.equal(heartbeatOnly.res.writableEnded, false, "decoded heartbeats prove the transport is alive beyond one minute");
+      for (let i = 0; i < 5; i++) {
+        heartbeatOnly.receive(heartbeat);
+        mock.timers.tick(50);
+      }
+      assert.equal(heartbeatOnly.res.writableEnded, true, "heartbeats cannot postpone the longer useful-output bound forever");
+      assert.match(heartbeatOnly.output(), /no useful output/);
 
       const partial = stream();
       partial.receive(thinking.subarray(0, 5));
@@ -139,25 +154,27 @@ test("the proxy measures decoded progress rather than heartbeat or partial-frame
         mock.timers.tick(50);
         partial.receive(thinking.subarray(i, i + 1));
       }
-      assert.equal(partial.res.writableEnded, true, "incomplete frames must not count as progress");
+      assert.equal(partial.res.writableEnded, true, "incomplete frames prove neither transport nor semantic progress");
 
       const active = stream();
       for (let i = 0; i < 10; i++) {
         mock.timers.tick(50);
         active.receive(thinking);
       }
-      assert.equal(active.res.writableEnded, false, "thinking must extend the deadline");
-      mock.timers.tick(150);
-      active.receive(frame({ case: "conversationCheckpointUpdate", value: {} }));
-      mock.timers.tick(150);
-      assert.equal(active.res.writableEnded, false, "checkpoints must extend the deadline");
-      active.receive(frame({ case: "kvServerMessage", value: { message: { case: "getBlobArgs", value: { blobId: new Uint8Array() } } } }));
-      mock.timers.tick(150);
-      assert.equal(active.res.writableEnded, false, "blob requests must extend the deadline");
-      active.req.emit("close");
-      const closedOutput = active.output();
+      assert.equal(active.res.writableEnded, false, "thinking extends both useful-output and transport deadlines");
+      for (let i = 0; i < 6; i++) {
+        active.receive(frame({ case: "conversationCheckpointUpdate", value: {} }));
+        mock.timers.tick(100);
+      }
+      assert.equal(active.res.writableEnded, true, "checkpoints keep transport alive but cannot extend the useful-output deadline");
+
+      const closedEarly = stream();
+      closedEarly.receive(thinking);
+      closedEarly.req.emit("close");
+      const closedOutput = closedEarly.output();
       mock.timers.tick(500);
-      assert.equal(active.output(), closedOutput, "closing must retire the watchdog");
+      assert.equal(closedEarly.output(), closedOutput, "closing must retire the watchdog");
+      assert.equal((closedEarly.output().match(/stream timed out/g) ?? []).length, 0, "a closed stream must not later report a stall");
     } finally {
       mock.timers.reset();
     }

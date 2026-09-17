@@ -223,19 +223,20 @@ export function parseMessages(
 /**
  * Rebuilding a conversation Cursor has no memory of.
  *
- * There are two ways to put words in front of the model, and they are not equally reliable:
+ * There are three ways to put words in front of the model, and they are not equally reliable:
  *
- *   - the request's own user message travels inline in the request — it is how the first turn
- *     of every conversation works, so it always arrives;
+ *   - the request's own user message travels inline in the request, but Cursor stops resuming
+ *     tool calls when that action grows past roughly 50–60 KiB;
+ *   - the root system prompt travels through a blob Cursor reliably fetches before the turn;
  *   - history turns travel as sha256 blob IDs. The words themselves stay on our side, and
  *     Cursor has to come back over the KV channel and ask for each blob. If it does not ask,
  *     or asks for something we do not hold, nothing surfaces and nothing complains: a missing
  *     blob is answered with an empty result.
  *
  * Replaying the restored session as history therefore put the compaction summary somewhere the
- * model could not read it — present in Pi's chat, invisible to Cursor. So the rebuild does not
- * use history at all: everything the model needs is rendered into the message it is answering,
- * through the channel that cannot silently drop it.
+ * model could not read it — present in Pi's chat, invisible to Cursor. Rendering all of it into
+ * the action fixed that omission but created a deterministic tool-resume stall on real sessions.
+ * The rebuild now keeps the action short and renders prior turns into the fetched system blob.
  */
 
 const CONTEXT_OPEN = "=== RESTORED SESSION CONTEXT ===";
@@ -278,13 +279,25 @@ const CONTINUATION_INSTRUCTION =
 
 export const CONTINUATION_PROMPT = CONTINUATION_INSTRUCTION;
 
+/** Put restored history in Cursor's fetched root prompt, never in its size-sensitive action. */
+export function systemPromptForRebuild(
+  systemPrompt: string,
+  parsed: Pick<ParsedMessages, "turns" | "pendingTurn">,
+  options: { hasCheckpoint: boolean },
+): string {
+  if (options.hasCheckpoint) return systemPrompt;
+  const transcript = renderTurnsAsText(allPriorTurns(parsed));
+  if (!transcript) return systemPrompt;
+  return `${systemPrompt}\n\n${CONTEXT_OPEN}\n${transcript}\n${CONTEXT_CLOSE}`;
+}
+
 /**
  * What to send as the request's user message.
  *
- * Rebuild path: the whole restored session is rendered into this text, because it is the only
- * channel that reliably reaches the model. Checkpoint path: Cursor already holds the history
- * and ignores ours, but its checkpoint has the assistant's tool calls without their results
- * (the stream died before delivery), so the results travel here instead.
+ * Rebuild path: restored history is in the system blob, so this stays a normal short question
+ * or continuation instruction. Checkpoint path: Cursor already holds the history, but its
+ * checkpoint has the assistant's tool calls without their results (the stream died before
+ * delivery), so the results travel here instead.
  */
 export function requestActionText(
   parsed: Pick<ParsedMessages, "userText" | "toolResults" | "turns" | "pendingTurn">,
@@ -298,11 +311,8 @@ export function requestActionText(
 
   const prior = allPriorTurns(parsed);
   const transcript = renderTurnsAsText(prior);
-  // A brand new conversation has nothing to restore — send the question as-is.
   if (!transcript) return parsed.userText;
-
-  const ask = parsed.pendingTurn ? CONTINUATION_INSTRUCTION : parsed.userText;
-  return `${CONTEXT_OPEN}\n${transcript}\n${CONTEXT_CLOSE}\n\n${ask}`;
+  return parsed.pendingTurn ? CONTINUATION_INSTRUCTION : parsed.userText;
 }
 
 /** @deprecated Use {@link requestActionText}. */

@@ -31,6 +31,16 @@ export type UsageSnapshot = {
 	serviceable?: boolean;
 	primary?: UsageWindow;
 	secondary?: UsageWindow;
+	/**
+	 * A third, separately-metered bucket a provider exposes BESIDE the two rotation windows.
+	 *
+	 * Cursor is the reason it exists: one Pro+ subscription bills three independent pools —
+	 * included models (`primary`), the third-party "other models" pool (`secondary`) and the
+	 * Grok Bot product, which meters on its own weekly reset. Unlike primary/secondary it does
+	 * not gate the account: a maxed extra bucket still leaves the other pools able to serve
+	 * work, so it is displayed but never treated as a rotation cooldown.
+	 */
+	tertiary?: UsageWindow;
 	credits?: {
 		hasCredits?: boolean;
 		unlimited?: boolean;
@@ -412,26 +422,152 @@ async function fetchOllamaUsageSnapshot(
 	}
 }
 
-function fetchCursorUsageSnapshot(
+// Cursor's own dashboard usage lives in the aiserver.v1.DashboardService Connect-RPC service.
+// The methods are undocumented; they were read out of Cursor's own clients (the editor and the
+// Grok Bot app) and verified live on 2026-09-12 — the same OAuth session token the bridge already
+// holds answers both, and the numbers match the dashboard exactly (97% / 35% / weekly 0%).
+const CURSOR_DASHBOARD_RPC_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService";
+
+/** The monthly pools: included models (`auto`) and third-party models (`api`). */
+export function parseCursorCurrentPeriodUsage(
 	provider: string,
-	credential: UsageCredential,
+	body: unknown,
+	fetchedAt = Date.now(),
 	credentialHash?: string,
-): UsageSnapshot {
-	if (credential.type !== "oauth" || !credential.access) {
-		throw new UsageFetchError(`${provider} has no OAuth access token`);
-	}
-	const now = Date.now();
-	// Cursor does not expose a usage/quota API. Only the subscription status is
-	// knowable, so report it honestly instead of fabricating a usage percentage
-	// from the OAuth token expiry. Token expiry is tracked separately by the
-	// invalidation/re-auth system.
+): UsageSnapshot | undefined {
+	const source = record(body);
+	const planUsage = record(source.planUsage ?? source.plan_usage);
+	const cycleStart = epochMs(source.billingCycleStart ?? source.billing_cycle_start);
+	const cycleEnd = epochMs(source.billingCycleEnd ?? source.billing_cycle_end);
+	const windowSeconds =
+		cycleStart !== undefined && cycleEnd !== undefined && cycleEnd > cycleStart
+			? Math.round((cycleEnd - cycleStart) / 1000)
+			: undefined;
+	const periodWindow = (value: unknown): UsageWindow | undefined => {
+		const usedPercent = percent(value);
+		if (usedPercent === undefined || cycleEnd === undefined) return undefined;
+		return {
+			usedPercent,
+			resetAt: cycleEnd,
+			...(windowSeconds !== undefined ? { windowSeconds } : {}),
+		};
+	};
+	const primary = periodWindow(planUsage.autoPercentUsed ?? planUsage.auto_percent_used);
+	const secondary = periodWindow(planUsage.apiPercentUsed ?? planUsage.api_percent_used);
+	if (!primary && !secondary) return undefined;
 	return {
 		provider,
 		family: "cursor",
-		fetchedAt: now,
+		fetchedAt,
 		credentialHash,
-		plan: "subscription",
+		primary,
+		secondary,
 	};
+}
+
+/** The Grok Bot weekly bucket, from the same dashboard service. */
+export function parseCursorSandUsage(body: unknown): UsageWindow | undefined {
+	const source = record(body);
+	const usedPercent = percent(source.usagePercent ?? source.usage_percent);
+	const resetAt = epochMs(source.nextResetTimestampUtc ?? source.next_reset_timestamp_utc);
+	const startAt = epochMs(source.currentPeriodStart ?? source.current_period_start);
+	if (usedPercent === undefined || resetAt === undefined) return undefined;
+	const windowSeconds =
+		startAt !== undefined && resetAt > startAt
+			? Math.round((resetAt - startAt) / 1000)
+			: undefined;
+	return {
+		usedPercent,
+		resetAt,
+		...(windowSeconds !== undefined ? { windowSeconds } : {}),
+	};
+}
+
+async function fetchCursorUsageSnapshot(
+	provider: string,
+	credential: UsageCredential,
+	options: {
+		fetchImpl?: typeof fetch;
+		timeoutMs?: number;
+		credentialHash?: string;
+	} = {},
+): Promise<UsageSnapshot> {
+	if (credential.type !== "oauth" || !credential.access) {
+		throw new UsageFetchError(`${provider} has no OAuth access token`);
+	}
+	const fetchedAt = Date.now();
+	// The plan-only snapshot is the old, always-honest answer. Quota numbers are an enrichment
+	// on top of it: a network hiccup must not blank the footer or report a healthy account as
+	// "usage unavailable", so every failure except 401 falls back to it.
+	const fallback = (): UsageSnapshot => ({
+		provider,
+		family: "cursor",
+		fetchedAt,
+		credentialHash: options.credentialHash,
+		plan: "subscription",
+	});
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
+	const fetchImpl = options.fetchImpl ?? fetch;
+	const call = async (method: string): Promise<Response> =>
+		fetchImpl(`${CURSOR_DASHBOARD_RPC_URL}/${method}`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${credential.access}`,
+				Accept: "application/json",
+				"Content-Type": "application/json",
+				"Connect-Protocol-Version": "1",
+			},
+			body: "{}",
+			signal: controller.signal,
+		});
+	try {
+		const [period, sand] = await Promise.allSettled([
+			call("GetCurrentPeriodUsage"),
+			call("GetSandUsageStatus"),
+		]);
+		// A 401 is the one failure worth surfacing: the caller refreshes the token and retries.
+		for (const result of [period, sand]) {
+			if (result.status === "fulfilled" && result.value.status === 401) {
+				throw new UsageFetchError(
+					`${provider} Cursor usage endpoint returned HTTP 401`,
+					401,
+				);
+			}
+		}
+		const bodyOf = async (result: PromiseSettledResult<Response>): Promise<unknown> => {
+			if (result.status !== "fulfilled" || !result.value.ok) return undefined;
+			try {
+				return await result.value.json();
+			} catch {
+				return undefined;
+			}
+		};
+		const periodBody = await bodyOf(period);
+		const sandBody = await bodyOf(sand);
+		const periodSnapshot =
+			periodBody !== undefined
+				? parseCursorCurrentPeriodUsage(provider, periodBody, fetchedAt, options.credentialHash)
+				: undefined;
+		const sandWindow = sandBody !== undefined ? parseCursorSandUsage(sandBody) : undefined;
+		if (!periodSnapshot && !sandWindow) return fallback();
+		const planName = record(sandBody).cursorPlanName;
+		return {
+			provider,
+			family: "cursor",
+			fetchedAt,
+			credentialHash: options.credentialHash,
+			plan: typeof planName === "string" && planName ? planName : "subscription",
+			primary: periodSnapshot?.primary,
+			secondary: periodSnapshot?.secondary,
+			tertiary: sandWindow,
+		};
+	} catch (error) {
+		if (error instanceof UsageFetchError) throw error;
+		return fallback();
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 export async function fetchUsageSnapshot(
@@ -450,11 +586,7 @@ export async function fetchUsageSnapshot(
 		return fetchOllamaUsageSnapshot(provider, credential, options);
 	}
 	if (family === "cursor") {
-		return fetchCursorUsageSnapshot(
-			provider,
-			credential,
-			options.credentialHash,
-		);
+		return fetchCursorUsageSnapshot(provider, credential, options);
 	}
 	if (family === "kimi-coding") {
 		// Kimi For Coding is a subscription behind an API key, and it publishes no quota endpoint —
@@ -558,6 +690,9 @@ export function shortAccount(account: string | undefined): string | undefined {
 	return local.length > 18 ? `${local.slice(0, 17)}…` : local;
 }
 
+/** Where a window sits in the snapshot: the two rotation windows, or an extra metered pool. */
+export type UsageWindowPosition = "primary" | "secondary" | "tertiary";
+
 /**
  * Name a quota window by how long it actually is.
  *
@@ -568,12 +703,18 @@ export function shortAccount(account: string | undefined): string | undefined {
 export function windowLabel(
 	window: UsageWindow,
 	family: UsageFamily,
-	position: "primary" | "secondary",
+	position: UsageWindowPosition,
 ): string {
-	if (family === "cursor") return position === "primary" ? "auth" : "7d";
+	// Cursor's pools are products, not durations: included models, the third-party pool, and the
+	// Grok Bot weekly bucket.
+	if (family === "cursor") {
+		if (position === "primary") return "models";
+		if (position === "secondary") return "other";
+		return "grok bot";
+	}
 	if (family === "ollama") return position === "primary" ? "session" : "weekly";
 	const seconds = window.windowSeconds;
-	if (!seconds) return position === "primary" ? "5h" : "7d";
+	if (!seconds) return position === "primary" ? "5h" : position === "secondary" ? "7d" : "usage";
 	if (seconds >= 20 * 86_400) return "30d";
 	if (seconds >= 6 * 86_400) return "7d";
 	if (seconds >= 20 * 3_600) return "24h";
@@ -589,7 +730,7 @@ export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): s
 	];
 	// The plan is what decides how much quota those percentages are a percentage OF — a free slot
 	// at 60% left and a Plus slot at 60% left are not comparable amounts of work.
-	if (snapshot.plan && (snapshot.primary || snapshot.secondary)) parts.push(snapshot.plan);
+	if (snapshot.plan && (snapshot.primary || snapshot.secondary || snapshot.tertiary)) parts.push(snapshot.plan);
 	// The account's own answer, when it gave one. A percentage is arithmetic on one window and can
 	// disagree with reality in both directions — an account reading 0% left was answering
 	// `allowed: true`, and showing only the 0% is what makes a working account look dead.
@@ -605,7 +746,12 @@ export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): s
 			`${windowLabel(snapshot.secondary, snapshot.family, "secondary")} ${remainingPercent(snapshot.secondary)}% left/${formatResetDuration(snapshot.secondary.resetAt, now)}`,
 		);
 	}
-	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
+	if (snapshot.tertiary) {
+		parts.push(
+			`${windowLabel(snapshot.tertiary, snapshot.family, "tertiary")} ${remainingPercent(snapshot.tertiary)}% left/${formatResetDuration(snapshot.tertiary.resetAt, now)}`,
+		);
+	}
+	if (!snapshot.primary && !snapshot.secondary && !snapshot.tertiary && snapshot.plan) {
 		if (snapshot.family === "ollama") {
 			parts.push(`${snapshot.plan} · quota unavailable`);
 		} else {
@@ -625,7 +771,7 @@ export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): s
 				? "The account reports it can be used right now."
 				: "The account reports it is currently blocked, whatever the percentages below say.",
 		);
-	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
+	if (!snapshot.primary && !snapshot.secondary && !snapshot.tertiary && snapshot.plan) {
 		if (snapshot.family === "ollama") {
 			lines.push(
 				`Plan: ${snapshot.plan}. Session/weekly quota is currently unavailable — check https://ollama.com/settings`,
@@ -637,6 +783,7 @@ export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): s
 	for (const [position, window] of [
 		["primary", snapshot.primary],
 		["secondary", snapshot.secondary],
+		["tertiary", snapshot.tertiary],
 	] as const) {
 		if (!window) continue;
 		const label =

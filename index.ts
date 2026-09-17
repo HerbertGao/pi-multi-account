@@ -35,6 +35,7 @@ import {
 	constants as fsConstants,
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
@@ -91,11 +92,21 @@ import {
 } from "./pi-contract.ts";
 import {
 	DEFAULT_PROVIDER_PRIORITY,
-	comparePriority,
 	describePriority,
 	normalizeGroup,
 	normalizePriority,
 } from "./provider-priority.ts";
+import {
+	classifyRouteAttempt,
+	rankAutomaticRouteCandidates,
+	type RouteAttemptFact,
+	type RouteDecision,
+	type RouteFailurePatterns,
+	type RouteModelRef,
+	type RouteRequestFact,
+	selectOperationRoute,
+	type ScoredRouteCandidate,
+} from "./completion-route-planner.ts";
 import {
 	DEFAULT_CONTEXT_GUARD_SETTINGS,
 	createOverheadTracker,
@@ -458,6 +469,7 @@ import {
 	windowLabel,
 	type UsageSnapshot,
 	type UsageWindow,
+	type UsageWindowPosition,
 } from "./usage.ts";
 
 type ModelRef = `${string}/${string}`;
@@ -1162,7 +1174,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.21.3";
+const VERSION = "1.22.0";
 function sourceFingerprint(): string {
 	try {
 		const root = dirname(fileURLToPath(import.meta.url));
@@ -1170,11 +1182,24 @@ function sourceFingerprint(): string {
 		const files = (manifest.files as string[]).filter((name) => name.endsWith(".ts")).sort();
 		const hash = createHash("sha256");
 		for (const name of files) hash.update(name).update(readFileSync(join(root, name)));
+		// package.json lists the vendored `cursor` directory as a whole, so a `.ts`
+		// suffix filter previously ignored every proxy/lifecycle change. Hash the
+		// TypeScript next to the proxy (not generated protobuf) so `/multi-account status`
+		// can tell a running Pi that Cursor source changed.
+		const cursorDir = join(root, "cursor");
+		if (existsSync(cursorDir)) {
+			for (const child of readdirSync(cursorDir).sort()) {
+				if (!child.endsWith(".ts")) continue;
+				const rel = `cursor/${child}`;
+				hash.update(rel).update(readFileSync(join(cursorDir, child)));
+			}
+		}
 		return hash.digest("hex").slice(0, 12);
 	} catch { return "unknown"; }
 }
 const LOADED_SOURCE_FINGERPRINT = sourceFingerprint();
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
+const SELECTED_FALLBACK_PENDING_PREFIX = "selected fallback:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
 // a failure of the current model (doing so would downgrade it to an older sibling on the same
@@ -1260,6 +1285,16 @@ const ANTHROPIC_BASE = "anthropic";
 const CODEX_BASE = "openai-codex";
 const OLLAMA_BASE = "ollama";
 const DEFAULT_QWEN_PROVIDER = "alibaba";
+
+/**
+ * Vendors that sell their own models directly, pay-per-token, with no subscription bundle.
+ * Recognising them lets `/multi-account status` split the unmanaged rotation into "metered
+ * native" (real money per token, still the manufacturer's own API) and genuinely unknown
+ * resellers. This is a billing/provenance policy list, not a model list — it does not need
+ * updating when a vendor ships a model. Mirrors FIRST_PARTY_DIRECT_APIS in
+ * pi-delegation-broker's provenance policy; keep the two in step.
+ */
+const METERED_NATIVE_PROVIDERS = new Set(["deepseek", "openai"]);
 
 const DEFAULT_LIMIT_PATTERNS = [
 	"429",
@@ -1352,6 +1387,15 @@ const DEFAULT_TRANSIENT_ERROR_PATTERNS = [
 	"websocket error",
 	"server error",
 ];
+
+/** Cursor watchdog text from `cursor/proxy.ts`. A Run failure, never quota evidence. */
+function isCursorUpstreamStall(text: string): boolean {
+	const lower = text.toLowerCase();
+	return (
+		(lower.includes("cursor run stalled") && lower.includes("timed out")) ||
+		(lower.includes("produced no output") && lower.includes("timed out"))
+	);
+}
 
 const DEFAULT_MODEL_ERROR_PATTERNS = [
 	"model_not_found",
@@ -3338,6 +3382,8 @@ function cooldownMsFromUsage(
 	// Treat the account as available when the primary window is not exhausted.
 	if (snapshot.primary && snapshot.primary.usedPercent < 100) return 0;
 
+	// Cursor's extra Grok Bot bucket is deliberately absent: a maxed extra pool does not make
+	// the account unusable, because the models/other pools can still serve work.
 	const windows = [snapshot.primary, snapshot.secondary].filter(
 		(w): w is UsageWindow => !!w,
 	);
@@ -3770,6 +3816,16 @@ export function explicitCliSelections(
 	};
 }
 
+interface HostCompletionRouter {
+	select(request: RouteRequestFact): RouteDecision | Promise<RouteDecision>;
+	onAttempt?(attempt: RouteAttemptFact): void | Promise<void>;
+}
+
+interface HostCompletionRouterAPI {
+	registerCompletionRouter?(router: HostCompletionRouter): void;
+	unregisterCompletionRouter?(): void;
+}
+
 export default function piMultiAccount(pi: ExtensionAPI) {
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
@@ -4128,7 +4184,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// Pending work is session-local. The shared state file may contain another Pi window's marker;
 	// using that marker as this window's runtime state makes two unrelated tasks resume each other.
 	let pendingResume:
-		| { from: ModelRef; reason: string; since: number }
+		| { from: ModelRef; reason: string; since: number; retryAt?: number }
 		| undefined;
 
 	// ----- the governor ----------------------------------------------------
@@ -4239,12 +4295,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let recoveryFailures = 0;
 	let breakerOpenUntil = 0;
 	// Pi owns a separate agent-level retry loop (`retry.maxRetries`, default 3). Remember the
-	// transient route across those low-level attempts so the extension allows one local retry but
-	// escalates the second consecutive 5xx/overload to another healthy route instead of wrapping
-	// Pi's retries in several more same-route continuation waves.
+	// transient route across those low-level attempts so recovery remains bounded without
+	// mistaking a transport/server failure for quota exhaustion or switching providers.
 	let transientFailureStreak:
 		| { route: ModelRef; count: number }
 		| undefined;
+	// Cursor transport recovery is bounded per route across the whole chain. A
+	// single current-route streak forgets the first route after switching and can
+	// ping-pong forever once its short cooldown expires.
+	const cursorStallFailuresByRoute = new Map<
+		ModelRef,
+		{ provider: string; count: number }
+	>();
 	// The thinking level the user intends for this session. pi.setModel() re-clamps AND
 	// persists the thinking level on every model switch, so without re-asserting it the level
 	// drifts downward across failovers ("thinking level keeps dropping"). But the intent must be
@@ -4304,13 +4366,30 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (!actual) {
 				/* host cannot report the level: keep whatever we already know, force nothing */
 			} else if (desiredThinkingLevel === undefined) {
-				// First turn of the session: whatever the session runs at IS the user's intent.
-				desiredThinkingLevel = actual;
+				// First turn of the session. Prefer the REMEMBERED user intent over whatever the host
+				// currently reports: a startup model switch can clamp the level first (a map may hide
+				// levels, and the host then applies a default), and adopting that clamp here is exactly
+				// how a hand-picked `max` disappeared for the rest of a session. The persisted value is
+				// the only evidence of what the user actually chose.
+				const remembered = persistedState.lastUserThinkingLevel;
+				const rememberedLevel =
+					thinkingRank(remembered) >= 0
+						? (remembered as ReasoningLevel)
+						: undefined;
+				desiredThinkingLevel = rememberedLevel ?? actual;
+				if (desiredThinkingLevel !== actual) {
+					logEvent("thinking_intent_recovered", {
+						observed: actual,
+						restored: desiredThinkingLevel,
+					});
+				}
 			} else if (
 				actual !== desiredThinkingLevel &&
 				!isKnownThinkingClamp(ctx, actual)
 			) {
 				// The user changed it (`/thinking`, or a delegated agent with its own level).
+				// Deliberately still adopted on any direction: the host reports no cause with the change,
+				// and a user who lowers the level between turns is observable only here.
 				logEvent("thinking_intent", { from: desiredThinkingLevel, to: actual });
 				desiredThinkingLevel = actual;
 			}
@@ -5286,7 +5365,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 *
 	 * refreshUsage() already applies a per-family TTL and deduplicates in-flight requests, so calling
 	 * this from the status timer is cheap: network traffic occurs only when an account's own snapshot
-	 * is stale. Qwen/Cursor use honest capability-only snapshots because they expose no quota API.
+	 * is stale. Qwen keeps an honest capability-only snapshot (its plans expose no quota API);
+	 * Cursor reads its three Pro+ pools from the dashboard service.
 	 */
 	async function refreshRotationUsage(ctx: any, force = false) {
 		if (!config.showUsage) {
@@ -5309,7 +5389,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function accountUsageCell(
 		snapshot: UsageSnapshot | undefined,
-		position: "primary" | "secondary",
+		position: UsageWindowPosition,
 		now: number,
 	): string {
 		const window = snapshot?.[position];
@@ -5357,13 +5437,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				snapshot?.plan ?? "—",
 				accountUsageCell(snapshot, "primary", now),
 				accountUsageCell(snapshot, "secondary", now),
+				accountUsageCell(snapshot, "tertiary", now),
 				status,
 			];
 		});
 		if (rows.length === 0) {
 			return "pi-multi-account accounts: no configured accounts in auth.json";
 		}
-		const header = ["Slot", "Alias", "Account", "Plan", "Primary", "Secondary", "Status"];
+		const header = ["Slot", "Alias", "Account", "Plan", "Primary", "Secondary", "Tertiary", "Status"];
 		const widths = header.map((title, column) =>
 			Math.max(title.length, ...rows.map((row) => row[column].length)),
 		);
@@ -5523,9 +5604,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return reason === BUSY_RETRY_REASON;
 	}
 
-	// Reasons where the source model is healthy and must be resumed as-is — never downgraded.
+	function isSelectedFallbackPendingReason(reason: string) {
+		return reason.startsWith(SELECTED_FALLBACK_PENDING_PREFIX);
+	}
+
+	// Reasons where the source model is healthy and must be resumed as-is — never downgraded
+	// or rotated back to the route it just replaced.
 	function isSameModelResumeReason(reason: string) {
-		return isTransientPendingReason(reason) || isBusyRetryPendingReason(reason);
+		return (
+			isTransientPendingReason(reason) ||
+			isBusyRetryPendingReason(reason) ||
+			isSelectedFallbackPendingReason(reason)
+		);
 	}
 
 	function isAuthPendingReason(reason: string) {
@@ -5845,6 +5935,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// merely bypassing it at selection time keeps the account looking spent in `status` and
 		// keeps the resume timer waiting on a bench that no longer means anything.
 		if (snapshot.serviceable === true) {
+			// A verdict observed BEFORE the refusal it would contradict is not evidence. The meter
+			// commonly reads "serviceable" while the account is actively refusing with a concrete
+			// horizon ("Try again in ~289 min"). Retiring the bench on that stale reading put the
+			// account straight back into rotation, where it was refused again by the same limit, and
+			// the loop ran until the hop cap stopped the session — the recorded "after a few rotations
+			// everything stops". Only a verdict fetched AFTER the refusal has answered for the account;
+			// that is what keeps the deliberate "usable clears the bench" contract below true without
+			// letting an older reading erase a newer refusal.
+			const refusedAt = limitStreakByProvider.get(provider)?.lastAt;
+			if (typeof refusedAt === "number" && snapshot.fetchedAt < refusedAt) return;
 			let changed = exhaustedUntilByProvider.delete(provider);
 			changed = usageUntrustedUntilByProvider.delete(provider) || changed;
 			if (changed) persist();
@@ -5959,6 +6059,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return rotation.filter(
 			(id) => !classifyProvider(id, config.qwenProvider),
 		);
+	}
+
+	/** Unmanaged members that are a vendor's own pay-per-token API (billed in money, not quota). */
+	function meteredNativeMembers(): string[] {
+		return unmanagedRotationMembers().filter((id) =>
+			METERED_NATIVE_PROVIDERS.has(id.replace(/-account-\d+$/, "")),
+		);
+	}
+
+	/** Unmanaged members that are not a first-party metered API — resellers and unknowns. */
+	function resellerRotationMembers(): string[] {
+		const metered = new Set(meteredNativeMembers());
+		return unmanagedRotationMembers().filter((id) => !metered.has(id));
 	}
 
 	/**
@@ -6484,42 +6597,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		const now = Date.now();
 
-		type Scored = {
-			model: any;
-			remaining: number;
-			rotIndex: number;
-			rank: number;
-			/** When this account last refused with a limit error. 0 = never, in this session. */
-			lastRefusalAt: number;
-			/**
-			 * Whether the UNCAPPED forecast still considers this account spent. The recheck ceiling
-			 * decides whether an account may be tried at all; this decides the ORDER. An account
-			 * nothing predicts as spent is always tried before one we are only re-probing because
-			 * its forecast went stale.
-			 */
-			predictedBusy: boolean;
-			/**
-			 * The provider itself said this account is usable, recently enough to believe.
-			 *
-			 * Distinct from "we hold no cooldown for it": that is absence of evidence, which is what
-			 * an account with no usage endpoint at all always looks like. Treating the two as equal
-			 * let an unmeasurable, out-of-quota account beat a measured, confirmed one.
-			 */
-			confirmed: boolean;
-			/** Provider group this candidate belongs to — what the priority ladder ranks. */
-			group: string;
-			/** Same provider family (or un-numbered base) as the account that just failed. */
-			sameFamily: boolean;
-			/** Same model identity, including effort-folded Cursor ids. */
-			sameModel: boolean;
-		};
-		// When preferLatestModel is on, the newest model wins ACROSS accounts — not just
-		// within one account. Without this, failing over from gpt-5.5 could land on the
-		// same account's older gpt-5.4 (lower rotIndex) instead of gpt-5.5 on a healthy
-		// account, silently downgrading the model. rank is the primary tiebreak.
-		const byRankThenRot = (a: Scored, b: Scored) =>
-			(config.preferLatestModel ? a.rank - b.rank : 0) ||
-			a.rotIndex - b.rotIndex;
+		type Scored = ScoredRouteCandidate<any>;
 		const scored: Scored[] = [];
 		const seen = new Set<string>();
 
@@ -6617,6 +6695,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				: "";
 			scored.push({
 				model: pick,
+				provider: pick.provider,
 				remaining,
 				rotIndex: i,
 				rank: modelRecencyRank(pick),
@@ -6665,61 +6744,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return ordered.map((s) => s.model);
 		}
 
-		// Among accounts that are selectable right now, prefer the one that refused LONGEST ago —
-		// an account that just answered "usage limit reached" is the least likely to answer
-		// differently seconds later, no matter how good its position or model rank is. Without this
-		// the rotation order alone could send us straight back to the account we just left, get the
-		// same refusal, and loop between two spent accounts while a live one sat further down.
-		const byRefusalAgeThenRank = (a: Scored, b: Scored) =>
-			// Among accounts not ruled out by liveness, stay in the same family and model first.
-			// A fresh blocked/100% verdict is filtered below before this preference is considered.
-			(options.preferSameIdentity !== false
-				? Number(b.sameModel) - Number(a.sameModel) ||
-					Number(b.sameFamily) - Number(a.sameFamily)
-				: 0) ||
-			Number(b.confirmed) - Number(a.confirmed) ||
-			Number(a.predictedBusy) - Number(b.predictedBusy) ||
-			// Every account of the family is spent — the step that had no policy at all. Of 602
-			// automatic failovers in the black box, 588 stayed inside the family and the other 14
-			// scattered across five different destinations, because nothing above rotation index
-			// expressed a preference and the index almost never got a say.
-			//
-			// It sits BELOW the two liveness signals on purpose, and an earlier draft that put it
-			// above them was wrong: evidence about a specific account has to beat a preference
-			// about its category, or a group ranked first would pull work onto an account the
-			// provider has already reported as spent while a live one waited. Two existing tests
-			// said so before this comment did. What is left for the ladder is exactly the case
-			// that was arbitrary — candidates the telemetry cannot separate — where it replaces
-			// "whoever refused longest ago, then whatever order discovery happened to produce"
-			// with a stated answer.
-			comparePriority(a.group, b.group, config.providerPriority) ||
-			a.lastRefusalAt - b.lastRefusalAt ||
-			byRankThenRot(a, b);
-		// Automatic routing never spends a user turn on an account whose fresh quota verdict says
-		// it is unavailable. Background usage refresh is the proof that revives it. Manual `next`
-		// remains the explicit override for stale forecasts and therefore uses the separate ring
-		// above, which deliberately ignores cooldown ordering.
-		let availableNow = scored
-			.filter((s) => s.remaining === 0)
-			.sort(byRefusalAgeThenRank);
-		if (
-			lastLeftProvider &&
-			now - lastLeftAt < ANTI_PINGPONG_MS &&
-			availableNow.length > 1
-		) {
-			const otherProvider = availableNow.filter(
-				(s) => s.model.provider !== lastLeftProvider,
-			);
-			if (otherProvider.length > 0) availableNow = otherProvider;
-		}
-		if (availableNow.length > 0) return availableNow.map((s) => s.model);
-
-		if (options.availableNowOnly) return [];
-		return scored
-			.sort(
-				(a, b) => a.remaining - b.remaining || byRefusalAgeThenRank(a, b),
-			)
-			.map((s) => s.model);
+		return rankAutomaticRouteCandidates(scored, {
+			preferLatestModel: config.preferLatestModel,
+			preferSameIdentity: options.preferSameIdentity !== false,
+			providerPriority: config.providerPriority,
+			availableNowOnly: options.availableNowOnly === true,
+			lastLeftProvider,
+			lastLeftAt,
+			antiPingPongMs: ANTI_PINGPONG_MS,
+			now,
+		});
 	}
 
 	/**
@@ -6863,7 +6897,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		failedModel: any,
 		reason: string,
 		cooldownMs = config.cooldownMs,
-		options: { manual?: boolean; scope?: "provider" | "model" } = {},
+		options: {
+			manual?: boolean;
+			scope?: "provider" | "model";
+			excludeProviders?: Iterable<string>;
+			allowFailedRouteResume?: boolean;
+		} = {},
 	) {
 		const switchEpoch = chainEpoch;
 		if (!automaticFailoverEnabled() || !failedModel?.provider || !failedModel?.id)
@@ -6888,13 +6927,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return false;
 		}
 
-		const excludeProviders = /auth (invalid|failure)/i.test(reason)
-			? new Set<string>([failedModel.provider])
-			: undefined;
+		const excludeProviders = new Set<string>(options.excludeProviders ?? []);
+		if (/auth (invalid|failure)/i.test(reason)) {
+			excludeProviders.add(failedModel.provider);
+		}
 		const candidates = findFallbackModels(ctx, failedModel, {
 			availableNowOnly: !options.manual,
 			manualRoundRobin: options.manual,
-			excludeProviders,
+			excludeProviders: excludeProviders.size > 0 ? excludeProviders : undefined,
 			preserveQualityBand: true,
 		});
 		// No OTHER account to move to. Because each account now offers only its flagship (the
@@ -6902,7 +6942,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// instead of enumerating a weaker sibling model — so this is the path that must resume the
 		// current account when usage shows it actually recovered, rather than downgrading.
 		if (candidates.length === 0) {
-			if (armSameAccountResumeIfReady(ctx, failedModel, reason, options))
+			if (
+				options.allowFailedRouteResume !== false &&
+				armSameAccountResumeIfReady(ctx, failedModel, reason, options)
+			)
 				return false;
 			const cooldowns = [...exhaustedUntilByProvider.entries()]
 				.filter(
@@ -6925,7 +6968,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Provider failover: no immediately available fallback after ${failedModel.provider}/${failedModel.id}. ${availability || "All known accounts may be unauthenticated, invalidated, or duplicate slots."}`,
 				"warning",
 			);
-			if (!options.manual && config.autoContinue)
+			if (
+				!options.manual &&
+				config.autoContinue &&
+				options.allowFailedRouteResume !== false
+			)
 				setPendingContinuation(ctx, failedModel, reason);
 			return false;
 		}
@@ -6938,7 +6985,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			{ armContinuation: !options.manual, manual: options.manual },
 		);
 		if (switchEpoch !== chainEpoch || userAbortedChain || ctx.signal?.aborted) return false;
-		if (!switched && !options.manual && config.autoContinue) {
+		if (
+			!switched &&
+			!options.manual &&
+			config.autoContinue &&
+			options.allowFailedRouteResume !== false
+		) {
 			if (!armSameAccountResumeIfReady(ctx, failedModel, reason, options))
 				setPendingContinuation(ctx, failedModel, reason);
 		}
@@ -7221,6 +7273,22 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		transientFailureStreak = undefined;
 	}
 
+	function clearCursorStallFailureHistory() {
+		cursorStallFailuresByRoute.clear();
+	}
+
+	function noteCursorStallFailure(model: { provider: string; id: string }): number {
+		const route = ref(model.provider, model.id);
+		const count = (cursorStallFailuresByRoute.get(route)?.count ?? 0) + 1;
+		cursorStallFailuresByRoute.set(route, { provider: model.provider, count });
+		logEvent("cursor_stall_failure", {
+			session: sessionInstanceId,
+			route,
+			count,
+		});
+		return count;
+	}
+
 	function noteTransientFailure(model: { provider: string; id: string }): number {
 		const route = ref(model.provider, model.id);
 		transientFailureStreak =
@@ -7235,13 +7303,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return transientFailureStreak.count;
 	}
 
-	// Any genuine forward progress (a successful provider response / assistant turn) proves
-	// recovery is working, so reset the failure streak and close advisory mode.
+	// Receiving successful HTTP headers means Pi's own retry has started. It makes
+	// an extension-owned pending wake redundant, but the response stream has not yet
+	// been consumed: do not erase route failure evidence or close the breaker here.
+	function noteProviderResponseStarted() {
+		if (hasPendingResume()) clearPendingContinuation();
+	}
+
+	// A completed non-error assistant message is genuine forward progress: reset
+	// route failure evidence and close advisory mode.
 	function noteRecoveryProgress() {
 		clearTransientFailureStreak();
-		// Pi may have satisfied a transient failure through its own agent-level retry before our
-		// pending wake fired. A successful provider response makes every session-local recovery
-		// obsolete; leaving it armed would duplicate already-successful work once the session idles.
 		if (hasPendingResume()) clearPendingContinuation();
 		if (recoveryFailures !== 0 || breakerOpenUntil !== 0) {
 			const wasOpen = breakerOpenUntil > Date.now();
@@ -7265,7 +7337,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			});
 			ctx?.ui?.notify?.(
 				`pi-multi-account [v${VERSION}]: automatic resume failed ${recoveryFailures}× in a row, so it is pausing auto-continue for ${formatDelay(BREAKER_COOLDOWN_MS)} (safe mode) to avoid making things worse. ` +
-					"It still flags rate limits and switches you to a fresh account — just send your next message, or use /multi-account next. (/multi-account reset re-enables auto-continue immediately.)",
+					"Temporary errors do not change your provider or model. Confirmed quota limits retain their separate failover policy. Send a new message to retry; /multi-account reset re-enables auto-continue immediately.",
 				"warning",
 			);
 		}
@@ -7360,14 +7432,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				typeof ctx?.abort === "function"
 			) {
 				ctx?.ui?.notify?.(
-					`Provider failover [v${VERSION}]: the resumed turn on ${where} has been silent for ${formatDelay(silentMs)} — auto-cancelling it and will resume automatically when an account is free${recovery}. (/multi-account stop to cancel, /multi-account status to inspect.)`,
+					`Provider retry [v${VERSION}]: the resumed turn on ${where} has been silent for ${formatDelay(silentMs)} — auto-cancelling this attempt; bounded recovery stays on the SAME provider and model. (/multi-account stop to cancel, /multi-account status to inspect.)`,
 					"warning",
 				);
 				watchdogAborting = true;
-				// Cool the wedged account briefly so the auto-resume does not immediately re-wedge
-				// on the same dead account before usage reconciliation catches up.
-				if (ctx.model?.provider)
-					markExhausted(ctx.model.provider, config.transientCooldownMs);
 				try {
 					ctx.abort();
 				} catch {
@@ -7456,11 +7524,26 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			(model: any) =>
 				model &&
 				!compactionUnfit(model.provider, now) &&
+				!isCursorProviderId(model.provider) &&
 				!(
 					model.provider === ctx.model?.provider &&
 					model.id === ctx.model?.id
 				),
 		);
+	}
+
+	function cursorFamilyProviderIds(ctx: any, extra?: string): Set<string> {
+		const ids = new Set<string>();
+		if (extra && isCursorProviderId(extra)) ids.add(extra);
+		for (const model of ctx?.modelRegistry?.getAll?.() ?? []) {
+			if (
+				typeof model?.provider === "string" &&
+				isCursorProviderId(model.provider)
+			) {
+				ids.add(model.provider);
+			}
+		}
+		return ids;
 	}
 
 	async function runHealthyCompaction(
@@ -7476,8 +7559,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// supplies the stream function, auth environment, retry policy and lifecycle
 			// callbacks. Do not replace that path with the extension's low-level helper.
 			// Routing is only needed when the active account is unavailable.
+			//
+			// Cursor is the exception. Pi's native path uses the session model, and a
+			// healthy Cursor Grok turn can sit silent for minutes while "Compacting
+			// context…" spins. Summarize on a non-Cursor live account, or cancel.
 			const currentReady = isCurrentModelReady(ctx);
-			if (currentReady) {
+			const currentIsCursor = isCursorProviderId(ctx.model?.provider ?? "");
+			if (currentReady && !currentIsCursor) {
 				compactionRoutedNote = undefined;
 				return undefined;
 			}
@@ -7490,11 +7578,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const candidates = compactionCandidates(ctx);
 			if (candidates.length === 0) {
 				ctx.ui?.notify?.(
-					"Provider failover: no live account can summarize; cancelled instead of hanging on the spent account.",
+					currentIsCursor
+						? "Provider failover: Cursor cannot summarize without hanging, and no other live account is available; cancelled instead of compacting on Cursor."
+						: "Provider failover: no live account can summarize; cancelled instead of hanging on the spent account.",
 					"warning",
 				);
 				return compactionCancelled(
-					"no live account for compaction; cancelled",
+					currentIsCursor
+						? "no non-Cursor account for compaction; cancelled"
+						: "no live account for compaction; cancelled",
 				);
 			}
 			let thinkingLevel: any;
@@ -7536,7 +7628,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					model.id === ctx.model?.id;
 				if (!isCurrent) {
 					ctx.ui?.notify?.(
-						`Provider failover: ${ctx.model?.provider ?? "active"} account is unavailable for compaction; summarizing on ${model.provider} instead.`,
+						currentIsCursor
+							? `Provider failover: summarizing on ${model.provider} instead of Cursor, which stalls during compaction.`
+							: `Provider failover: ${ctx.model?.provider ?? "active"} account is unavailable for compaction; summarizing on ${model.provider} instead.`,
 						"info",
 					);
 				}
@@ -8080,7 +8174,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// recovery time across every rotation account means one free account elsewhere holds this
 		// at the floor indefinitely, which is how a wait that never changed anything re-checked
 		// once a second for four minutes.
-		return Math.max(pendingWakeBackoffMs, nextAt - now);
+		return Math.max(pendingWakeBackoffMs, nextAt - now, (pendingResume?.retryAt ?? now) - now);
 	}
 
 	/** A wake that changed nothing waits twice as long as the last one, up to the poll interval. */
@@ -8123,6 +8217,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		resetGovernor();
 		startFreshFailoverChain();
 		clearTransientFailureStreak();
+		clearCursorStallFailureHistory();
 		userAbortedChain = false;
 		currentPromptSwitch = undefined;
 		continuationDispatchedForAgentTurn = false;
@@ -8225,7 +8320,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// on the same account, whose quota is shared, so the downgrade escapes nothing).
 		if (isSameModelResumeReason(pendingResume?.reason ?? "")) {
 			const now = Date.now();
-			if (providerRecoveryAt(sourceModel.provider, now) <= now) {
+			if (providerRecoveryAt(sourceModel.provider, now) <= now && (pendingResume?.retryAt ?? now) <= now) {
+				const resumeReason = pendingResume?.reason;
 				clearPendingContinuation();
 				const same = ref(sourceModel.provider, sourceModel.id);
 				// Deliberately NOT routed through the governor: this is not a rotation, it is
@@ -8258,7 +8354,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (epoch !== chainEpoch || sessionClosed) return;
 				await resumeWithExistingContext(ctx, {
 					from: same,
-					reason: pendingResume?.reason,
+					reason: resumeReason,
 				});
 				return;
 			}
@@ -8353,6 +8449,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			from,
 			reason,
 			since: pendingResume?.since ?? Date.now(),
+			// Backoff belongs to this attempt, never shared account/quota health.
+			retryAt: isTransientPendingReason(reason) ? Date.now() + config.transientCooldownMs : undefined,
 		};
 		logEvent("pending_resume_set", {
 			session: sessionInstanceId,
@@ -8387,11 +8485,40 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				busy
 					? `Provider failover [v${VERSION}]: the previous turn is still busy on ${failedModel.provider}/${failedModel.id}. Resuming the SAME model in ~${formatDelay(delay)} (re-checks every ${formatDelay(config.pendingPollMs)}) — it will not be downgraded. Esc, a new message, or /multi-account stop cancels it.`
 					: transient
-						? `Provider failover: temporary server error on ${failedModel.provider}. Retrying the same account in ~${formatDelay(delay)} (re-checks every ${formatDelay(config.pendingPollMs)}). Esc, a new message, or /multi-account stop cancels it.`
+						? `Provider retry: temporary error on ${failedModel.provider}/${failedModel.id}. Retrying the SAME account and model in ~${formatDelay(delay)} (re-checks every ${formatDelay(config.pendingPollMs)}). Esc, a new message, or /multi-account stop cancels it.`
 						: `Provider failover: all accounts are cooling down. This session will retry automatically in ~${formatDelay(delay)} (and re-checks every ${formatDelay(config.pendingPollMs)}). Esc during a run, a new user message, /multi-account stop, or leaving the session cancels it.`,
 				"warning",
 			);
 		}
+	}
+
+	// A failed Run is not a failed subscription. Retry the exact route; neither
+	// repeated 5xx nor a watchdog proves that another provider is authorized.
+	function retryTemporaryFailure(ctx: any, failedModel: { provider: string; id: string }, errorText: string) {
+		const cursorStall = isCursorProviderId(failedModel.provider) && isCursorUpstreamStall(errorText);
+		const failures = cursorStall ? noteCursorStallFailure(failedModel) : noteTransientFailure(failedModel);
+		if (continuationDispatchedForAgentTurn || activeResumeWatch) noteRecoveryFailure(ctx);
+		currentPromptSwitch = undefined;
+		clearPendingContinuation();
+		if (cursorStall) logEvent("cursor_upstream_stall", {
+			session: sessionInstanceId,
+			provider: failedModel.provider,
+			model: failedModel.id,
+			consecutiveFailures: failures,
+			error: errorText,
+		});
+		if (failures > BREAKER_FAILURE_THRESHOLD || isBreakerOpen()) {
+			ctx.ui.notify(
+				`Provider retry: stopped after ${failures} failed attempts on ${failedModel.provider}/${failedModel.id}. Provider and model were NOT changed; this is not quota exhaustion. Send a new message to retry.`,
+				"warning",
+			);
+			return;
+		}
+		if (!config.autoContinue) {
+			ctx.ui.notify(`Provider retry: temporary error on ${failedModel.provider}/${failedModel.id}; automatic retry is disabled. Provider and model were NOT changed.`, "warning");
+			return;
+		}
+		setPendingContinuation(ctx, failedModel, `${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`);
 	}
 
 	// ----- cold-start input hold -------------------------------------------
@@ -9449,7 +9576,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Rotation (${rotation.length}): ${rotation.join(" → ") || "none — log in to an account"}`,
 				// Naming them is the point: they used to be dropped from rotation in silence, so
 				// nothing inside the tool ever revealed that logged-in accounts were sitting idle.
-				`Other providers (no quota tracking): ${unmanagedRotationMembers().join(", ") || (config.includeOtherProviders ? "none" : "disabled by includeOtherProviders")}`,
+				`Metered native providers (pay per token): ${meteredNativeMembers().join(", ") || "none"}`,
+				`Other providers (no quota tracking): ${resellerRotationMembers().join(", ") || (config.includeOtherProviders ? "none" : "disabled by includeOtherProviders")}`,
 				`Needs models configured (in rotation but unusable): ${unconfiguredRotationMembers(ctx).join(", ") || "none"}`,
 				`Duplicate slots skipped: ${duplicateSlots.length ? duplicateSlots.map(({ duplicate, primary }) => `${duplicate} = ${primary}`).join(", ") : "none"}`,
 				`Registered login slots: ${[...registeredSlots].join(", ") || "(base accounts only)"}`,
@@ -10080,26 +10208,39 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		if (!allowAction("carry on after compaction", ctx)) return undefined;
-		autoContinuesThisPrompt++;
-		logEvent("compaction_continue", {
-			compactionReason: event?.reason,
-			model: `${ctx?.model?.provider}/${ctx?.model?.id}`,
-			hop: autoContinuesThisPrompt,
-			budget: config.maxAutoContinuesPerPrompt,
-		});
-		// Queued synchronously: `sendCustomMessage` reaches `agent.followUp()` before its first
-		// await, so the queue is populated by the time `_runAutoCompaction` reads
-		// `hasQueuedMessages()` a few lines later.
-		pi.sendMessage(
-			{
-				customType: CONTINUE_AFTER_COMPACTION_TYPE,
-				content: CONTINUE_AFTER_COMPACTION_PROMPT,
-				// Visible on purpose: the agent carrying on by itself must be something the user
-				// can see a reason for in the transcript, not something that just happens.
-				display: true,
-			} as any,
-			{ deliverAs: "followUp" },
-		);
+		// This custom follow-up starts a new host run without passing through `input`.
+		// Mark it before queueing so `before_agent_start` cannot mistake it for fresh owner
+		// intent and reset the failover evidence/budget that survived the compaction.
+		const wasExpectingInjectedContinuation = expectingInjectedContinuation;
+		expectingInjectedContinuation = true;
+		try {
+			// Queued synchronously: `sendCustomMessage` reaches `agent.followUp()` before its first
+			// await, so the queue is populated by the time `_runAutoCompaction` reads
+			// `hasQueuedMessages()` a few lines later.
+			pi.sendMessage(
+				{
+					customType: CONTINUE_AFTER_COMPACTION_TYPE,
+					content: CONTINUE_AFTER_COMPACTION_PROMPT,
+					// Visible on purpose: the agent carrying on by itself must be something the user
+					// can see a reason for in the transcript, not something that just happens.
+					display: true,
+				} as any,
+				{ deliverAs: "followUp" },
+			);
+			autoContinuesThisPrompt++;
+			logEvent("compaction_continue", {
+				compactionReason: event?.reason,
+				model: `${ctx?.model?.provider}/${ctx?.model?.id}`,
+				hop: autoContinuesThisPrompt,
+				budget: config.maxAutoContinuesPerPrompt,
+			});
+		} catch (error) {
+			expectingInjectedContinuation = wasExpectingInjectedContinuation;
+			logEvent("compaction_continue_failed", {
+				compactionReason: event?.reason,
+				error: String(error).slice(0, 200),
+			});
+		}
 		return undefined;
 	});
 
@@ -10108,15 +10249,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// reliable place to say "the session is not spinning", and it is a hook this extension
 		// already depends on — so the governor is watching something known to work on this host
 		// rather than something it hopes exists.
-		noteProviderRequestObserved();
+		const request = event?.request as
+			| { kind?: string; sessionId?: string; model?: RouteModelRef }
+			| undefined;
+		if (request?.kind !== "background") noteProviderRequestObserved();
 		const shaped = shapeAnthropicOAuthPayload(event.payload);
 		const payload = (shaped ?? event.payload) as
 			| Record<string, unknown>
 			| undefined;
-		const provider = ctx?.model?.provider;
+		const provider = request?.model?.provider ?? ctx?.model?.provider;
 		if (payload && typeof provider === "string") {
 			if (isCursorProviderId(provider)) {
-				payload.pi_session_id = ctx?.sessionManager?.getSessionId?.();
+				payload.pi_session_id = request?.sessionId ?? ctx?.sessionManager?.getSessionId?.();
 			}
 			// Qwen/Alibaba rejects the OpenAI-only `developer` role — normalize it to `system`.
 			if (classifyProvider(provider, config.qwenProvider) === "qwen") {
@@ -10131,6 +10275,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let slotProxyServer: Server | undefined;
 	let slotProxyPort: number | undefined;
 	let slotProxyStarting: Promise<number | undefined> | undefined;
+	let completionRouterContext: any;
 	/**
 	 * Another live process already holds the canonical port.
 	 *
@@ -10511,6 +10656,150 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		logEvent("slot_proxy_published", { port, slots });
 	}
 
+	function completionFailurePatterns(): RouteFailurePatterns {
+		return {
+			ignore: config.ignoreErrorPatterns,
+			auth: config.authErrorPatterns,
+			limit: config.limitErrorPatterns,
+			transient: config.transientErrorPatterns,
+			model: config.modelErrorPatterns,
+			contextOverflow: DEFAULT_IGNORE_PATTERNS,
+		};
+	}
+
+	function usableCompletionRoute(ctx: any, route: RouteModelRef): RouteModelRef | undefined {
+		const model = findModelIncludingHidden(ctx, route.provider, route.id);
+		const now = Date.now();
+		const hasAuth = model ? providerHasUsableAuth(ctx, route.provider) : false;
+		const invalidated = isInvalidated(route.provider);
+		const recoveryAt = providerRecoveryAt(route.provider, now);
+		const modelUntil = model ? (exhaustedUntilByModel.get(ref(model.provider, model.id)) ?? 0) : 0;
+		const ready = !!model && hasAuth && !invalidated && recoveryAt <= now && modelUntil <= now;
+		if (!ready) {
+			logEvent("completion_route_unusable", {
+				provider: route.provider,
+				id: route.id,
+				found: !!model,
+				hasAuth,
+				invalidated,
+				recoveryMs: recoveryAt - now,
+				modelUntilMs: modelUntil - now,
+			});
+			return undefined;
+		}
+		return { provider: model.provider, id: model.id };
+	}
+
+	function completionFallbackCandidates(ctx: any, request: RouteRequestFact): RouteModelRef[] {
+		const sourceRef = request.previous?.model ?? request.sessionModel;
+		const sourceModel = sourceRef
+			? findModelIncludingHidden(ctx, sourceRef.provider, sourceRef.id) ?? sourceRef
+			: ctx.model;
+		if (!sourceModel?.provider || !sourceModel?.id) return [];
+		return findFallbackModels(ctx, sourceModel, {
+			availableNowOnly: true,
+			includeCurrent: true,
+			preserveQualityBand: true,
+		}).map((model: any) => ({ provider: model.provider, id: model.id }));
+	}
+
+	async function observeBackgroundCompletionAttempt(attempt: RouteAttemptFact): Promise<void> {
+		const kind = classifyRouteAttempt(attempt, completionFailurePatterns());
+		const provider = attempt.model.provider;
+		const modelId = attempt.model.id;
+		const errorText = attempt.errorMessage ?? "";
+		logEvent("background_completion_attempt", {
+			operationId: attempt.operationId,
+			purpose: attempt.purpose,
+			attempt: attempt.attempt,
+			provider,
+			model: modelId,
+			dispatched: attempt.dispatched,
+			status: attempt.response?.status ?? null,
+			classified: kind,
+			error: errorText,
+		});
+		switch (kind) {
+			case "success":
+				noteAuthSuccess(provider, modelId);
+				return;
+			case "auth":
+				markAuthFailure(provider, errorText || `HTTP ${attempt.response?.status ?? 401}`);
+				return;
+			case "limit": {
+				const inferred = await resolveLimitCooldownMs(
+					completionRouterContext,
+					provider,
+					errorText || `HTTP ${attempt.response?.status ?? 429}`,
+				);
+				markExhausted(provider, Math.max(inferred, attempt.response?.retryAfterMs ?? 0));
+				return;
+			}
+			case "model":
+				markModelExhausted(attempt.model, config.transientCooldownMs);
+				return;
+			case "cursor_stall":
+			case "transient":
+				// The operation lease may retry this exact route once, but other operations and
+				// the next foreground turn should not pile onto a route that just failed.
+				markExhausted(provider, config.transientCooldownMs);
+				return;
+			case "aborted":
+			case "context_overflow":
+			case "route_unavailable":
+			case "unhandled":
+				// Cancellation, host validation, prompt size, and consumer/schema failures are
+				// not provider-health evidence and therefore never poison shared state.
+				return;
+			default: {
+				const exhaustive: never = kind;
+				return exhaustive;
+			}
+		}
+	}
+
+	const completionHost = pi as ExtensionAPI & HostCompletionRouterAPI;
+	if (typeof completionHost.registerCompletionRouter === "function") {
+		completionHost.registerCompletionRouter({
+			select: (rawRequest) => {
+				const ctx = completionRouterContext;
+				if (!ctx || sessionClosed || !automaticFailoverEnabled()) {
+					return { action: "stop", reason: "Multi-account completion routing is not active" };
+				}
+				const request: RouteRequestFact = {
+					...rawRequest,
+					preferredModels: rawRequest.preferredModels
+						.map((route) => usableCompletionRoute(ctx, route))
+						.filter((route): route is RouteModelRef => route !== undefined),
+					sessionModel: rawRequest.sessionModel
+						? usableCompletionRoute(ctx, rawRequest.sessionModel)
+						: undefined,
+				};
+				const orderedCandidates = completionFallbackCandidates(ctx, request);
+				const decision = selectOperationRoute({
+					request,
+					orderedCandidates,
+					patterns: completionFailurePatterns(),
+					maxSameRouteTransientRetries: 1,
+					transientRetryDelayMs: Math.min(config.transientCooldownMs, 1_000),
+				});
+				logEvent("completion_route_select", {
+					operationId: rawRequest.operationId,
+					purpose: rawRequest.purpose,
+					attempt: rawRequest.attempt,
+					rawSession: rawRequest.sessionModel,
+					rawPreferred: rawRequest.preferredModels,
+					sessionModel: request.sessionModel ?? null,
+					preferred: request.preferredModels,
+					candidates: orderedCandidates,
+					decision,
+				});
+				return decision;
+			},
+			onAttempt: observeBackgroundCompletionAttempt,
+		});
+	}
+
 	function preflightHostCapabilities(ctx: any) {
 		const has = (name: string) =>
 			typeof (pi as unknown as Record<string, unknown>)[name] === "function";
@@ -10521,6 +10810,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			continueAgent: has("continueAgent"), // seamless in-place resume
 			on: has("on"),
 			registerCommand: has("registerCommand"),
+			registerCompletionRouter: has("registerCompletionRouter"),
 		};
 		const canSwitch = caps.setModel;
 		const canResume = caps.continueAgent || caps.sendUserMessage;
@@ -10558,7 +10848,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 			} else if (!seamlessResume) {
 				ctx.ui?.notify?.(
-					`pi-multi-account v${VERSION}: seamless in-place resume (pi.continueAgent) is not available on this Pi build — failover WILL still switch accounts and auto-continue by re-injecting your task as a fresh turn. This is the expected fallback, not an error.`,
+					`pi-multi-account v${VERSION}: seamless in-place resume (pi.continueAgent) is not available on this Pi build — automatic recovery resumes from the preserved task context in a fresh turn. Temporary errors keep the same provider/model; confirmed quota limits retain failover. This is the expected fallback, not an error.`,
 					"info",
 				);
 			}
@@ -10569,6 +10859,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_start", async (_event, ctx) => {
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
+		completionRouterContext = ctx;
 		manualRouteOwnsErrors = false;
 		lastObservedModelKey = thinkingModelKey(ctx);
 		lastObservedThinkingLevel = readThinkingLevel();
@@ -10676,6 +10967,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_shutdown", async (_event, ctx) => {
 		chainEpoch++;
 		sessionClosed = true;
+		completionRouterContext = undefined;
 		modelCatalogContext = undefined;
 		rememberUserModel(ctx?.model);
 		if (pendingWakeTimer) {
@@ -10732,16 +11024,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				flushDelayMs: flushDelay ?? null,
 			});
 		}
-		// runHealthyCompaction returns undefined only when routing is off or the current
-		// account is healthy. If the current account is still spent, do not let Pi default
-		// compact on it — that is the hang.
+		// runHealthyCompaction returns undefined when routing is off, the current
+		// account is healthy and not Cursor, or there is nothing to prepare. A spent
+		// account must not reach Pi's untimed default. A healthy Cursor account must
+		// not either: that is the compaction hang.
 		if (
 			config.routeCompactionToHealthyAccount &&
-			!isCurrentModelReady(ctx)
+			(!isCurrentModelReady(ctx) ||
+				isCursorProviderId(ctx.model?.provider ?? ""))
 		) {
 			return {
 				cancel: true,
-				reason: "active account unavailable for compaction",
+				reason: isCursorProviderId(ctx.model?.provider ?? "")
+					? "Cursor cannot compact natively without hanging"
+					: "active account unavailable for compaction",
 			};
 		}
 		return undefined;
@@ -11061,6 +11357,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("after_provider_response", (event, ctx) => {
+		const request = (event as any).request as
+			| { kind?: string; model?: RouteModelRef }
+			| undefined;
+		if (request?.kind === "background") {
+			const route = request.model;
+			if (route && usageFamily(route.provider) === "codex") {
+				const entry = readAuthFile()[route.provider];
+				const snapshot = parseCodexUsageHeaders(
+					route.provider,
+					(event as any).headers ?? {},
+					Date.now(),
+					entry ? credentialHash(entry) : undefined,
+				);
+				if (snapshot) storeUsage(ctx, snapshot);
+			}
+			return;
+		}
 		noteResumeProgress(); // a provider response arrived → the resumed turn is alive
 		// The governor's ground truth. Deliberately ahead of every other check, `config.enabled`
 		// included: whether a request reached a provider is a fact about the session, not
@@ -11081,7 +11394,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (status < 400 && ctx.model) {
 			noteProviderSuccessObserved();
 			noteAuthSuccess(ctx.model.provider, ctx.model.id);
-			noteRecoveryProgress(); // a good response → recovery works → close the breaker
+			noteProviderResponseStarted();
 			responseCooldownHints.delete(ctx.model.provider);
 			return;
 		}
@@ -11146,21 +11459,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			provider,
 			id: modelId,
 		};
+		const failureKind = classifyRouteAttempt(
+			{
+				operationId: `foreground:${sessionInstanceId}`,
+				purpose: "agent-turn",
+				attempt: 1,
+				model: { provider, id: modelId },
+				dispatched: true,
+				stopReason: "error",
+				errorMessage: errorText,
+			},
+			completionFailurePatterns(),
+		);
 		logEvent("assistant_error", {
 			session: sessionInstanceId,
 			provider,
 			model: modelId,
-			classified: isAuthError(errorText)
-				? "auth"
-				: isContextOverflowError(errorText)
-					? "context_overflow"
-					: isLimitError(errorText)
-						? "limit"
-						: isModelError(errorText)
-							? "model"
-							: isTransientError(errorText)
-								? "transient"
-								: "unhandled",
+			classified: failureKind,
 			error: errorText,
 		});
 
@@ -11180,6 +11495,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				});
 				return;
 			}
+			if (failureKind === "transient" || failureKind === "cursor_stall") {
+				retryTemporaryFailure(ctx, failedModel, errorText);
+				return;
+			}
 			// A quota or authorization refusal is about the ACCOUNT, not the model, and it does not
 			// clear in a minute: an unmanaged account out of credits refuses everything until it is
 			// topped up. Benching only the model for `transientCooldownMs` let the very next switch
@@ -11187,12 +11506,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// how a session ended up answering every user message with the same "out of credits"
 			// error while live accounts sat unused. Transient blips and model-specific errors keep
 			// the light touch, because those genuinely are momentary or model-scoped.
-			const accountLevel = isLimitError(errorText) || isAuthError(errorText);
-			if (
-				accountLevel ||
-				isModelError(errorText) ||
-				isTransientError(errorText)
-			) {
+			const accountLevel = failureKind === "limit" || failureKind === "auth";
+			if (accountLevel || failureKind === "model") {
 				await switchToFallback(
 					ctx,
 					failedModel,
@@ -11204,7 +11519,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (isAuthError(errorText)) {
+		if (failureKind === "auth") {
 			let killed = false;
 			let reason = errorText;
 			if (
@@ -11274,7 +11589,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		if (isLimitError(errorText)) {
+		if (failureKind === "limit") {
 			const cooldownMs = await resolveLimitCooldownMs(ctx, provider, errorText);
 			if (staleError()) return;
 			responseCooldownHints.delete(provider);
@@ -11286,7 +11601,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		if (isModelError(errorText)) {
+		if (failureKind === "model") {
 			await switchToFallback(
 				ctx,
 				failedModel,
@@ -11296,68 +11611,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		if (isTransientError(errorText)) {
-			const consecutiveFailures = noteTransientFailure({
-				provider,
-				id: modelId,
-			});
-			const automaticRecovery =
-				continuationDispatchedForAgentTurn || activeResumeWatch;
-			// A failed turn WE resumed still feeds the breaker. Unlike v1.21.2, opening the breaker
-			// does not prevent a useful switch: maybeDispatchContinuation will leave the session idle
-			// on the fresh route when safe mode is open.
-			if (automaticRecovery) noteRecoveryFailure(ctx);
-
-			const reason = `${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`;
-			if (consecutiveFailures >= 2) {
-				// One local retry is enough evidence to separate a blip from a persistently bad route.
-				// Clear the first failure's same-route wake and any old switch before escalating. A
-				// successful switch gets a fallback-owned wake rather than an immediate agent_end
-				// continuation: Pi may already be about to retry natively. Whichever succeeds first
-				// clears the wake, so the two recovery layers cannot duplicate the task.
-				currentPromptSwitch = undefined;
-				clearPendingContinuation();
-				const escalationReason =
-					`repeated temporary provider failure (${consecutiveFailures} consecutive): ${errorText.slice(0, 100)}`;
-				const switched = await switchToFallback(
-					ctx,
-					failedModel,
-					escalationReason,
-					config.transientCooldownMs,
-				);
-				if (staleError()) return;
-				if (switched) {
-					const fallback = ctx.model;
-					currentPromptSwitch = undefined;
-					if (
-						config.autoContinue &&
-						fallback?.provider &&
-						fallback?.id
-					) {
-						setPendingContinuation(
-							ctx,
-							fallback,
-							`resume after ${escalationReason}`,
-						);
-					}
-				}
-				return;
-			}
-
-			markExhausted(provider, config.transientCooldownMs);
-			if (!config.autoContinue) {
-				ctx.ui.notify(
-					`Provider failover: temporary server error on ${provider}/${modelId}. Retry manually in ~${formatDelay(config.transientCooldownMs)}.`,
-					"warning",
-				);
-				return;
-			}
-			if (isBreakerOpen()) {
-				currentPromptSwitch = undefined;
-				clearPendingContinuation();
-				return;
-			}
-			setPendingContinuation(ctx, failedModel, reason);
+		if (failureKind === "transient" || failureKind === "cursor_stall") {
+			retryTemporaryFailure(ctx, failedModel, errorText);
 		}
 	});
 
@@ -11378,7 +11633,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				setPendingContinuation(
 					ctx,
 					failed,
-					"auto-recovered a stuck resume; waiting for an account to free up",
+					`${TRANSIENT_PENDING_PREFIX} interrupted a stuck resume; retrying the same provider and model`,
 				);
 			}
 			return;
