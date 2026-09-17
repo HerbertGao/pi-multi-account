@@ -27,7 +27,7 @@ Reviewed domains: product behavior, host/API contracts, architecture, async/reso
 - Synchronized local baseline: 575 tests passed before backlog integration.
 - Both community PRs merged and tested in a separate worktree: 597 tests passed, TypeScript and package/privacy checks passed.
 - Supported host dependencies aligned to Pi/pi-ai 0.85.1; no installed user runtime upgraded.
-- Release candidate: 602 tests passed, TypeScript and package/privacy checks passed.
+- Final release candidate: 603 tests passed, TypeScript and package/privacy checks passed. Linux CI exposed expected bounded `ELOCKED` contention in the saturated four-process test; its workload now retries asynchronously with a deadline. A separate regression proves the production 250ms lock bound fails without mutation and allows a later retry. Production lock timing was not relaxed.
 - Fresh real-provider Cursor process completed native shell plus two reads and final response in 8.349 seconds. Trace included native `shellStreamArgs`, `exec.stream_closed`, `turnEnded`; no error or provider switch. Normal 60s/300s watchdog bounds, no fault injection. This is a capability check, not a reliability-rate estimate.
 - Fresh combined extension startup (multi-account, broker and six other installed extensions): commands registered, no extension errors, isolated empty authentication store preserved.
 - Final GitHub CI and trusted npm publication remain separate release gates; their results are recorded by the GitHub workflows and release.
