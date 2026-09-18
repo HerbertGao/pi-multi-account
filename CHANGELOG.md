@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.
+
 - A bodyless `429 status code (no body)` from an unmanaged provider now retries the same route instead of being treated as provider-wide credit exhaustion. The retry honors `Retry-After` when available and otherwise uses the transient delay, avoiding both an unrelated-provider failover and a false six-hour bench for providers such as Cerebras.
 
 ## [1.22.0] — 2026-09-17
