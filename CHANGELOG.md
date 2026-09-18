@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- A bodyless `429 status code (no body)` from an unmanaged provider now retries the same route instead of being treated as provider-wide credit exhaustion. The retry honors `Retry-After` when available and otherwise uses the transient delay, avoiding both an unrelated-provider failover and a false six-hour bench for providers such as Cerebras.
+
 ## [1.22.0] — 2026-09-17
 
 ### Compatibility

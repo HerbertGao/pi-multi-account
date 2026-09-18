@@ -6414,6 +6414,42 @@ test("a quota error on the ACTIVE unmanaged provider (e.g. plain openai API) sti
 	);
 });
 
+test("a bodyless 429 on an active unmanaged provider retries the same route", async () => {
+	const t = setup({
+		current: { provider: "cerebras", id: "qwen-3.8-27b" },
+		config: { transientCooldownMs: 60_000 },
+	});
+	await finishError(t, "cerebras", "qwen-3.8-27b", "429 status code (no body)");
+
+	assert.deepEqual(t.rec.setModels, [], "a bodyless throttle must not authorize failover");
+	const state = t.readState();
+	assert.equal(state.pendingFrom, "cerebras/qwen-3.8-27b");
+	assert.equal(
+		state.exhaustedUntilByProvider?.cerebras,
+		undefined,
+		"a bodyless rate limit must not poison the whole provider",
+	);
+	assert.equal(state.exhaustedUntilByModel?.["cerebras/qwen-3.8-27b"], undefined);
+	assert.match(t.rec.notifies.join("\n"), /temporary error.*cerebras\/qwen-3\.8-27b/i);
+	assert.doesNotMatch(t.rec.notifies.join("\n"), /out of quota/i);
+});
+
+test("a bodyless unmanaged 429 honors Retry-After on the same-route retry", async () => {
+	const t = setup({
+		current: { provider: "cerebras", id: "qwen-3.8-27b" },
+		config: { transientCooldownMs: 60_000 },
+	});
+	await t.fire("after_provider_response", {
+		status: 429,
+		headers: { "retry-after": "120" },
+	});
+	await finishError(t, "cerebras", "qwen-3.8-27b", "429 status code (no body)");
+
+	assert.deepEqual(t.rec.setModels, []);
+	assert.equal(t.readState().pendingFrom, "cerebras/qwen-3.8-27b");
+	assert.match(t.rec.notifies.join("\n"), /same account and model in ~2m/i);
+});
+
 test("neverFailoverProviders leaves an unmanaged provider's own retry logic alone", async () => {
 	const t = setup({
 		// Same situation as the test above — an actionable error on the ACTIVE unmanaged

@@ -8568,7 +8568,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		else growPendingWakeBackoff();
 	}
 
-	function setPendingContinuation(ctx: any, failedModel: any, reason: string) {
+	function setPendingContinuation(
+		ctx: any,
+		failedModel: any,
+		reason: string,
+		retryDelayMs = config.transientCooldownMs,
+	) {
 		// A stop that leaves an armed resume behind in the state file is not a stop: the next
 		// session reads it, `status` reports work pending, and the user is told something is
 		// waiting to continue when nothing is.
@@ -8580,7 +8585,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			reason,
 			since: pendingResume?.since ?? Date.now(),
 			// Backoff belongs to this attempt, never shared account/quota health.
-			retryAt: isTransientPendingReason(reason) ? Date.now() + config.transientCooldownMs : undefined,
+			retryAt: isTransientPendingReason(reason) ? Date.now() + retryDelayMs : undefined,
 		};
 		logEvent("pending_resume_set", {
 			session: sessionInstanceId,
@@ -8624,7 +8629,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// A failed Run is not a failed subscription. Retry the exact route; neither
 	// repeated 5xx nor a watchdog proves that another provider is authorized.
-	function retryTemporaryFailure(ctx: any, failedModel: { provider: string; id: string }, errorText: string) {
+	function retryTemporaryFailure(
+		ctx: any,
+		failedModel: { provider: string; id: string },
+		errorText: string,
+		retryDelayMs = config.transientCooldownMs,
+	) {
 		const cursorStall = isCursorProviderId(failedModel.provider) && isCursorUpstreamStall(errorText);
 		const failures = cursorStall ? noteCursorStallFailure(failedModel) : noteTransientFailure(failedModel);
 		if (continuationDispatchedForAgentTurn || activeResumeWatch) noteRecoveryFailure(ctx);
@@ -8648,7 +8658,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.ui.notify(`Provider retry: temporary error on ${failedModel.provider}/${failedModel.id}; automatic retry is disabled. Provider and model were NOT changed.`, "warning");
 			return;
 		}
-		setPendingContinuation(ctx, failedModel, `${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`);
+		setPendingContinuation(
+			ctx,
+			failedModel,
+			`${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`,
+			retryDelayMs,
+		);
 	}
 
 	// ----- cold-start input hold -------------------------------------------
@@ -11543,9 +11558,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if ((status === 429 || status === 402 || status === 403) && ctx.model) {
-			// Only set cooldown hints for providers this extension manages.
-			// Without this guard, a 429 on any provider pollutes cooldown state.
-			if (!classifyProvider(ctx.model.provider, config.qwenProvider)) return;
+			// Managed providers use these hints for every limit response. For unmanaged
+			// providers retain only 429 hints: they let a bodyless rate limit use the
+			// server's Retry-After instead of the six-hour quota cooldown.
+			if (
+				status !== 429 &&
+				!classifyProvider(ctx.model.provider, config.qwenProvider)
+			) return;
 			const cooldownMs = cooldownFromHeaders((event as any).headers ?? {});
 			if (cooldownMs !== undefined) {
 				responseCooldownHints.set(
@@ -11641,6 +11660,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			if (failureKind === "transient" || failureKind === "cursor_stall") {
 				retryTemporaryFailure(ctx, failedModel, errorText);
+				return;
+			}
+			// A bodyless 429 proves throttling, not account-level credit exhaustion.
+			// Retry the same route after Retry-After (or the normal transient minute)
+			// instead of poisoning the whole provider for six hours.
+			if (/^429 status code \(no body\)$/i.test(errorText.trim())) {
+				const retryDelayMs =
+					responseCooldownHints.get(provider) ?? config.transientCooldownMs;
+				responseCooldownHints.delete(provider);
+				retryTemporaryFailure(ctx, failedModel, errorText, retryDelayMs);
 				return;
 			}
 			// A quota or authorization refusal is about the ACCOUNT, not the model, and it does not
