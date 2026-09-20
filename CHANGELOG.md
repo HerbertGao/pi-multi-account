@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added `resumeAfterAllAccountsRecover` (default `true`) as a separate live-session liveness control. A real quota/rate-limit wall across every compatible account remains armed even when immediate `autoContinue` is disabled, polls recovery independently of footer visibility, and resumes on the first account that is genuinely usable.
+
 ### Fixed
 
+- A continuation that exhausted its newly selected fallback no longer stops after one hop: the next quota-driven switch receives its own continuation.
+- Asynchronous rejection of Pi's injected follow-up no longer loses the interrupted task; the selected fallback remains armed for a bounded retry.
 - `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.
-
 - A bodyless `429 status code (no body)` from an unmanaged provider now retries the same route instead of being treated as provider-wide credit exhaustion. The retry honors `Retry-After` when available and otherwise uses the transient delay, avoiding both an unrelated-provider failover and a false six-hour bench for providers such as Cerebras.
 
 ## [1.22.0] — 2026-09-17
