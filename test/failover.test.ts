@@ -332,6 +332,8 @@ function setup(opts: {
 	continueBlocks?: () => Promise<void>;
 	omitContinueAgent?: boolean;
 	omitSendUserMessage?: boolean;
+	/** Reject this many prompt-injection attempts before accepting one. */
+	sendUserMessageRejects?: number;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
 	/** Optional exact host catalog by provider, used for cross-family/apex routing tests. */
@@ -601,6 +603,7 @@ function setup(opts: {
 		return delivery;
 	};
 
+	let sendUserMessageRejects = opts.sendUserMessageRejects ?? 0;
 	const pi: any = {
 		events: {
 			on: (name: string, handler: (payload: any) => void) => {
@@ -668,8 +671,13 @@ function setup(opts: {
 				await handler({ model: ctx.model, previousModel, source: "set" }, ctx);
 			return true;
 		},
-		sendUserMessage: (prompt: string, options?: Record<string, unknown>) =>
-			rec.sent.push({ prompt, options }),
+		sendUserMessage: async (prompt: string, options?: Record<string, unknown>) => {
+			rec.sent.push({ prompt, options });
+			if (sendUserMessageRejects > 0) {
+				sendUserMessageRejects--;
+				throw new Error("Agent is already processing");
+			}
+		},
 		sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
 			rec.customMessages.push({ message, options });
 			return Promise.resolve();
@@ -2240,6 +2248,44 @@ test("manual switch revives a stuck invalidation and selects the account", async
 	);
 });
 
+test("a continuation that hits quota on its fallback continues onto the next account", async () => {
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "codex-2",
+			refresh: "codex-2-refresh",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-4": {
+			type: "oauth",
+			access: "codex-4",
+			refresh: "codex-4-refresh",
+			accountId: "codex-4",
+		},
+		anthropic: { type: "oauth", access: "anthropic-live", refresh: "anthropic-refresh" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { autoDiscover: false },
+		omitContinueAgent: true,
+	});
+	await finishError(t, "openai-codex-account-2", "gpt-5.5", "429 rate limit");
+	assert.equal(t.ctx.model.provider, "openai-codex-account-4");
+	assert.equal(t.rec.sent.length, 1, "the first failover must continue the task");
+
+	await t.fire("before_agent_start", {});
+	await t.fire("agent_start", {});
+	await finishError(t, "openai-codex-account-4", "gpt-5.5", "429 rate limit");
+
+	assert.equal(t.ctx.model.provider, "anthropic");
+	assert.equal(
+		t.rec.sent.length,
+		2,
+		"stale continuation state must not suppress the next failover continuation",
+	);
+});
+
 test("a second account failure in the same agent chain is not hidden by the previous switch", async () => {
 	const accounts: Account = {
 		"openai-codex-account-2": {
@@ -2583,6 +2629,106 @@ test("all-limited work resumes in the same live session after cooldown", async (
 		"the task resumes once the account cooldown expires",
 	);
 	assert.ok(!t.readState().pendingFrom);
+});
+
+test("quota recovery is independent from immediate auto-continue", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoContinue: false,
+			resumeAfterAllAccountsRecover: true,
+			cooldownMs: 1000,
+			probeCooldownMs: 1000,
+		},
+		omitContinueAgent: true,
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.ok(t.readState().pendingFrom, "the separate quota-recovery option must arm the wait");
+	await wait(1200);
+	assert.equal(t.rec.sent.length, 1, "the recovered task must resume without ordinary autoContinue");
+	assert.equal(t.readState().pendingFrom, undefined);
+});
+
+test("quota recovery can be disabled without disabling immediate auto-continue", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoContinue: true,
+			resumeAfterAllAccountsRecover: false,
+			cooldownMs: 1000,
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.readState().pendingFrom, undefined, "the explicit all-limited opt-out must not park work");
+	await wait(1100);
+	assert.equal(t.rec.continueCalls.length, 0);
+});
+
+test("reloading config cancels an owned quota wake when the option is turned off", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			resumeAfterAllAccountsRecover: true,
+			cooldownMs: 60_000,
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.ok(t.readState().pendingFrom);
+	const raw = JSON.parse(readFileSync(CONFIG, "utf8"));
+	writeFileSync(CONFIG, JSON.stringify({ ...raw, resumeAfterAllAccountsRecover: false }));
+	await t.command("reload");
+	assert.equal(t.readState().pendingFrom, undefined);
+	await t.fire("session_shutdown");
+});
+
+test("all-limited recovery polls provider availability even when the footer is hidden", async () => {
+	const originalFetch = globalThis.fetch;
+	let probes = 0;
+	globalThis.fetch = (async () => {
+		probes++;
+		return new Response(JSON.stringify({
+			plan_type: "plus",
+			rate_limit: {
+				allowed: true,
+				limit_reached: false,
+				primary_window: {
+					used_percent: 20,
+					limit_window_seconds: 18_000,
+					reset_at: Math.floor(Date.now() / 1000) + 3600,
+				},
+			},
+		}), { status: 200 });
+	}) as typeof fetch;
+	const t = setup({
+		accounts: {
+			"openai-codex": {
+				type: "oauth",
+				access: "quota-recovery-secret",
+				refresh: "quota-recovery-refresh",
+				accountId: "quota-recovery-workspace",
+			},
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			showUsage: false,
+			resumeAfterAllAccountsRecover: true,
+			cooldownMs: 60_000,
+			pendingPollMs: 25,
+		},
+	});
+	try {
+		await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+		assert.ok(t.readState().pendingFrom, "a long estimated cooldown must leave a live wake");
+		await wait(1200);
+		assert.ok(probes > 0, "quota recovery must probe independently of footer visibility");
+		assert.equal(t.rec.continueCalls.length, 1, "fresh allowed=true must wake the task promptly");
+	} finally {
+		globalThis.fetch = originalFetch;
+		await t.fire("session_shutdown");
+	}
 });
 
 test("session shutdown cancels pending work permanently", async () => {
@@ -5487,6 +5633,22 @@ test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by i
 		1,
 		"it falls back to injecting the continuation prompt so the work keeps moving by itself",
 	);
+});
+
+test("a rejected prompt injection remains armed and retries on the selected fallback", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 25 },
+		omitContinueAgent: true,
+		sendUserMessageRejects: 1,
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.ctx.model.provider, "openai-codex-account-2");
+	assert.equal(t.rec.sent.length, 1, "the first injection attempt must reach the host");
+	assert.ok(t.readState().pendingFrom, "an asynchronous host rejection must re-arm the continuation");
+	await wait(1100);
+	assert.equal(t.rec.sent.length, 2, "the selected fallback must retry its continuation");
+	assert.equal(t.readState().pendingFrom, undefined);
 });
 
 test("host build WITHOUT pi.continueAgent still auto-resumes the failover (inject continuation prompt) instead of dead-ending with a red 'Update @earendil-works/pi-coding-agent' error", async () => {

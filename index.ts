@@ -530,6 +530,12 @@ type AnthropicOAuthAliasConfig = {
 type ProviderFailoverConfig = {
 	enabled?: boolean;
 	autoContinue?: boolean;
+	/**
+	 * Keep quota-blocked work armed when every compatible account is cooling, then resume in the
+	 * same live session as soon as any account is genuinely usable. Independent of the immediate
+	 * post-switch `autoContinue` setting. Default: true.
+	 */
+	resumeAfterAllAccountsRecover?: boolean;
 	autoDiscover?: boolean;
 	autoDiscoverModels?: boolean;
 	maxAccountsPerProvider?: number;
@@ -656,6 +662,7 @@ type RuntimeConfig = Required<
 		ProviderFailoverConfig,
 		| "enabled"
 		| "autoContinue"
+		| "resumeAfterAllAccountsRecover"
 		| "autoDiscover"
 		| "autoDiscoverModels"
 		| "maxAccountsPerProvider"
@@ -1767,6 +1774,7 @@ const DEFAULT_CURSOR_MODELS = ["cursor-grok-4.6", "grok-4.6", "composer-2.5"];
 const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	enabled: true,
 	autoContinue: true,
+	resumeAfterAllAccountsRecover: true,
 	autoDiscover: true,
 	autoDiscoverModels: true,
 	maxAccountsPerProvider: 10,
@@ -1916,6 +1924,8 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 	return {
 		enabled: raw.enabled ?? true,
 		autoContinue: raw.autoContinue ?? true,
+		resumeAfterAllAccountsRecover:
+			raw.resumeAfterAllAccountsRecover ?? true,
 		autoDiscover: raw.autoDiscover ?? true,
 		autoDiscoverModels: raw.autoDiscoverModels ?? true,
 		maxAccountsPerProvider: Math.max(
@@ -4265,8 +4275,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let usageStatusTimer: ReturnType<typeof setInterval> | undefined;
 	// Pending work is session-local. The shared state file may contain another Pi window's marker;
 	// using that marker as this window's runtime state makes two unrelated tasks resume each other.
+	type PendingResumeMode = "auto-continue" | "quota-recovery";
 	let pendingResume:
-		| { from: ModelRef; reason: string; since: number; retryAt?: number }
+		| {
+				from: ModelRef;
+				reason: string;
+				since: number;
+				retryAt?: number;
+				mode: PendingResumeMode;
+			}
 		| undefined;
 
 	// ----- the governor ----------------------------------------------------
@@ -6111,14 +6128,32 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * enabled) and acts only on a FRESH cached snapshot, so resume is never stalled on a slow probe
 	 * and a stale pre-limit reading can never clear a cooldown prematurely.
 	 */
-	function reconcileCooldownsFromUsage(ctx: any) {
+	function reconcileCooldownsFromUsage(
+		ctx: any,
+		options: { allowWhenHidden?: boolean } = {},
+	) {
 		const now = Date.now();
 		for (const [provider, until] of [...exhaustedUntilByProvider.entries()]) {
 			if (until <= now || isInvalidated(provider) || !usageFamily(provider))
 				continue;
-			runBackground("cooldown reconcile usage", ctx, () =>
-				refreshUsage(ctx, provider, true),
-			);
+			runBackground("cooldown reconcile usage", ctx, async () => {
+				const snapshot = await refreshUsage(
+					ctx,
+					provider,
+					true,
+					options.allowWhenHidden ?? false,
+				);
+				// A provider's fresh "usable now" verdict should shorten an already-armed
+				// multi-hour timer immediately. Schedule through the single owned timer rather
+				// than calling the resume body concurrently for every recovered account.
+				if (
+					snapshot &&
+					pendingResume?.mode === "quota-recovery" &&
+					providerRecoveryAt(provider) <= Date.now()
+				) {
+					schedulePendingWake(ctx);
+				}
+			});
 			const cached = usageByProvider.get(provider);
 			if (cached && now - cached.fetchedAt < usageCacheTtl(provider))
 				applyUsageToCooldown(provider, cached, now);
@@ -7040,6 +7075,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			scope?: "provider" | "model";
 			excludeProviders?: Iterable<string>;
 			allowFailedRouteResume?: boolean;
+			/** This failure is real quota evidence; if no route is ready, use the separate wait option. */
+			waitForQuotaRecovery?: boolean;
 		} = {},
 	) {
 		if (!options.manual && (isFailoverExempt(failedModel?.provider) || isFailoverExempt(ctx.model?.provider))) return false;
@@ -7107,12 +7144,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Provider failover: no immediately available fallback after ${failedModel.provider}/${failedModel.id}. ${availability || "All known accounts may be unauthenticated, invalidated, or duplicate slots."}`,
 				"warning",
 			);
+			const shouldWait = options.waitForQuotaRecovery
+				? config.resumeAfterAllAccountsRecover
+				: config.autoContinue;
 			if (
 				!options.manual &&
-				config.autoContinue &&
+				shouldWait &&
 				options.allowFailedRouteResume !== false
 			)
-				setPendingContinuation(ctx, failedModel, reason);
+				setPendingContinuation(ctx, failedModel, reason, {
+					mode: options.waitForQuotaRecovery
+						? "quota-recovery"
+						: "auto-continue",
+				});
 			return false;
 		}
 
@@ -7342,6 +7386,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function hasPendingResume(): boolean {
 		return !!pendingResume;
+	}
+
+	function pendingResumeEnabled(
+		pending = pendingResume,
+	): boolean {
+		if (!pending) return false;
+		return pending.mode === "quota-recovery"
+			? config.resumeAfterAllAccountsRecover
+			: config.autoContinue;
 	}
 
 	// Reject a promise that does not settle within `ms`. Used to bound every network-bound
@@ -7889,10 +7942,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// continueAgent() cannot pick up. Inject the continuation prompt as a fresh USER turn so the
 	// session keeps moving on the account we just switched to, WITHOUT the user re-typing anything.
 	// Bounded by maxAutoContinuesPerPrompt. Returns true when it started a continuation turn.
-	function injectContinuationPrompt(
+	async function injectContinuationPrompt(
 		ctx: any,
-		resumeFrom?: { from?: ModelRef; reason?: string },
-	): boolean {
+		resumeFrom?: {
+			from?: ModelRef;
+			reason?: string;
+			allowWhenAutoContinueDisabled?: boolean;
+		},
+	): Promise<boolean> {
 		// `currentPromptSwitch` is set ONLY when we actually rotated accounts. The pending-resume
 		// path (transient overload, or a cooldown that expired on the same account) deliberately
 		// returns to the SAME account, so it never has a switch record. Requiring one here meant
@@ -7902,7 +7959,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const source = currentPromptSwitch ?? resumeFrom;
 		const blocked = !source
 			? "no switch or resume context"
-			: !config.autoContinue
+			: !config.autoContinue && !resumeFrom?.allowWhenAutoContinueDisabled
 				? "autoContinue disabled"
 				: userAbortedChain
 					? "user aborted the chain"
@@ -7926,7 +7983,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				: "the active account");
 		const sameModelRetry = source?.from === to;
 		const prompt = sameModelRetry
-			? `Provider retry activated: retrying ${to} after a temporary failure; no account or model switch occurred. Continue the interrupted task from where it stopped. The interrupted turn is preserved verbatim in this session as a [handoff:interrupted-turn] record — read it before acting and do not restart the task from the beginning.`
+			? resumeFrom?.allowWhenAutoContinueDisabled
+				? `Provider quota recovery activated: ${to} is usable again after every compatible account was limited. Continue the interrupted task from where it stopped. The interrupted turn is preserved verbatim in this session as a [handoff:interrupted-turn] record — read it before acting and do not restart the task from the beginning.`
+				: `Provider retry activated: retrying ${to} after a temporary failure; no account or model switch occurred. Continue the interrupted task from where it stopped. The interrupted turn is preserved verbatim in this session as a [handoff:interrupted-turn] record — read it before acting and do not restart the task from the beginning.`
 			: config.continuationPrompt
 					.replaceAll("{from}", String(source?.from ?? "the previous account"))
 					.replaceAll("{to}", String(to))
@@ -7941,21 +8000,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// current turn settles instead of being rejected; the host ignores it when not streaming.
 			// `sendUserMessage` is async on the host: a rejected promise would otherwise escape this
 			// synchronous try/catch as an unhandled rejection AND still report success here.
-			const dispatched = pi.sendUserMessage(prompt, {
-				deliverAs: "followUp",
-			}) as unknown;
-			if (
-				dispatched &&
-				typeof (dispatched as Promise<void>).catch === "function"
-			) {
-				(dispatched as Promise<void>).catch((error) => {
-					expectingInjectedContinuation = false;
-					logEvent("continuation_injection_failed", {
-						error: String(error).slice(0, 200),
-					});
-					reportExtensionError("continuation injection", error, ctx);
-				});
-			}
+			await Promise.resolve(
+				pi.sendUserMessage(prompt, {
+					deliverAs: "followUp",
+				}),
+			);
 			logEvent("continuation_injected", {
 				session: sessionInstanceId,
 				from: source?.from,
@@ -7977,7 +8026,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		ctx: any,
 		// Set by the pending-resume path, which returns to the SAME account and therefore has no
 		// `currentPromptSwitch`. Without it the prompt-injection fallback refuses to fire.
-		resumeFrom?: { from?: ModelRef; reason?: string },
+		resumeFrom?: {
+			from?: ModelRef;
+			reason?: string;
+			allowWhenAutoContinueDisabled?: boolean;
+		},
 	): Promise<boolean> {
 		const resumeEpoch = chainEpoch;
 		if (sessionClosed || userAbortedChain || ctx.signal?.aborted) return false;
@@ -7997,7 +8050,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// @earendil-works/pi-coding-agent). Do NOT dead-end the failover with a red error that
 			// leaves the user reloading by hand: fall back to injecting the continuation prompt so the
 			// work resumes by itself on the account we just switched to.
-			if (injectContinuationPrompt(ctx, resumeFrom)) return true;
+			if (await injectContinuationPrompt(ctx, resumeFrom)) return true;
 			// Reaching here means the injection fallback ALSO declined — the reason is in the
 			// debug log as continuation_injection_blocked/_failed. Do not blame the Pi build:
 			// the missing pi.continueAgent is only why we took the fallback path, never why the
@@ -8074,10 +8127,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// continuation prompt as a user message instead. That always starts a turn, so the
 				// session keeps moving by itself (this is how auto-recovery after a watchdog abort
 				// continues without the user re-typing anything). Bounded by maxAutoContinuesPerPrompt.
-				if (injectContinuationPrompt(ctx, resumeFrom)) return true;
-				// Nothing to continue (spurious) or injection unavailable — drop stale state quietly.
-				currentPromptSwitch = undefined;
-				clearPendingContinuation();
+				if (await injectContinuationPrompt(ctx, resumeFrom)) return true;
+				// Keep the selected route/context available to the caller. A host can reject a
+				// follow-up during a narrow busy race; dropping the switch here turns that transient
+				// rejection into a permanently stopped task.
 				return false;
 			}
 			noteRecoveryFailure(ctx);
@@ -8091,15 +8144,24 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
-	async function maybeDispatchContinuation(ctx: any): Promise<boolean> {
+	async function maybeDispatchContinuation(
+		ctx: any,
+		options: {
+			allowWhenAutoContinueDisabled?: boolean;
+			pendingMode?: PendingResumeMode;
+		} = {},
+	): Promise<boolean> {
+		const allowRecoveryResume =
+			options.allowWhenAutoContinueDisabled === true;
 		if (
-			!config.autoContinue ||
+			(!config.autoContinue && !allowRecoveryResume) ||
 			userAbortedChain ||
 			ctx.signal?.aborted ||
 			!currentPromptSwitch ||
 			autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt
 		)
 			return false;
+		const dispatchSwitch = currentPromptSwitch;
 		// Circuit breaker open → advisory mode. The account switch already happened (useful);
 		// we just don't attempt the auto-resume that has been failing. The user's next message
 		// runs on the fresh account. This is the floor: never worse than switching by hand.
@@ -8120,18 +8182,46 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!isCurrentModelReady(ctx)) {
 			const failed =
 				ctx.model?.provider && ctx.model?.id ? ctx.model : undefined;
-			if (failed && config.autoContinue) {
+			if (failed && (config.autoContinue || allowRecoveryResume)) {
 				setPendingContinuation(
 					ctx,
 					failed,
-					currentPromptSwitch?.reason ?? "account is cooling down",
+					dispatchSwitch.reason || "account is cooling down",
+					{ mode: options.pendingMode ?? "auto-continue" },
 				);
 			}
 			return false;
 		}
-		const resumed = await resumeWithExistingContext(ctx);
-		if (resumed) continuationDispatchedForAgentTurn = true;
-		return resumed;
+		const resumed = await resumeWithExistingContext(ctx, {
+			from: dispatchSwitch.from,
+			reason: dispatchSwitch.reason,
+			allowWhenAutoContinueDisabled: allowRecoveryResume,
+		});
+		if (resumed) {
+			continuationDispatchedForAgentTurn = true;
+			return true;
+		}
+		// `sendUserMessage(..., followUp)` can reject asynchronously if the host is still
+		// crossing a turn boundary. Preserve the selected fallback and retry there instead of
+		// reporting a switch whose task never actually continued.
+		if (
+			!hasPendingResume() &&
+			currentPromptSwitch === dispatchSwitch &&
+			!sessionClosed &&
+			!userAbortedChain &&
+			!ctx.signal?.aborted
+		) {
+			const failed =
+				ctx.model?.provider && ctx.model?.id ? ctx.model : undefined;
+			if (failed)
+				setPendingContinuation(
+					ctx,
+					failed,
+					`${SELECTED_FALLBACK_PENDING_PREFIX} ${dispatchSwitch.reason}`,
+					{ mode: options.pendingMode ?? "auto-continue" },
+				);
+		}
+		return false;
 	}
 
 	// ----- the governor, continued -----------------------------------------
@@ -8379,7 +8469,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			!hasPendingResume() ||
 			userAbortedChain ||
 			!automaticFailoverEnabled() ||
-			!config.autoContinue
+			!pendingResumeEnabled()
 		)
 			return;
 		const delay = nextPendingWakeDelayMs();
@@ -8408,7 +8498,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			isBreakerOpen() ||
 			userAbortedChain ||
 			!automaticFailoverEnabled() ||
-			!config.autoContinue
+			!pendingResumeEnabled()
 		)
 			return;
 		if (!ctx.isIdle()) {
@@ -8441,10 +8531,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		refreshDiscovery();
-		reconcileCooldownsFromUsage(ctx);
+		reconcileCooldownsFromUsage(ctx, {
+			allowWhenHidden: pendingResume?.mode === "quota-recovery",
+		});
 		pruneCooldowns();
-		const parsedFrom = pendingResume?.from
-			? parseTarget(pendingResume.from)
+		const pendingSnapshot = pendingResume;
+		const pendingMode = pendingSnapshot?.mode ?? "auto-continue";
+		const allowRecoveryResume = pendingMode === "quota-recovery";
+		const parsedFrom = pendingSnapshot?.from
+			? parseTarget(pendingSnapshot.from)
 			: undefined;
 		const sourceModel = parsedFrom
 			? {
@@ -8462,10 +8557,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// NOT account/model failures: retry the SAME account/model after any brief cooldown —
 		// never rotate to a sibling model (which would silently downgrade e.g. gpt-5.5 → gpt-5.4
 		// on the same account, whose quota is shared, so the downgrade escapes nothing).
-		if (isSameModelResumeReason(pendingResume?.reason ?? "")) {
+		if (isSameModelResumeReason(pendingSnapshot?.reason ?? "")) {
 			const now = Date.now();
-			if (providerRecoveryAt(sourceModel.provider, now) <= now && (pendingResume?.retryAt ?? now) <= now) {
-				const resumeReason = pendingResume?.reason;
+			if (providerRecoveryAt(sourceModel.provider, now) <= now && (pendingSnapshot?.retryAt ?? now) <= now) {
+				const resumeReason = pendingSnapshot?.reason;
 				clearPendingContinuation();
 				const same = ref(sourceModel.provider, sourceModel.id);
 				// Deliberately NOT routed through the governor: this is not a rotation, it is
@@ -8496,17 +8591,32 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// Pass the context explicitly or the injection fallback declines and the user has
 				// to re-send the prompt by hand.
 				if (epoch !== chainEpoch || sessionClosed) return;
-				await resumeWithExistingContext(ctx, {
+				const resumed = await resumeWithExistingContext(ctx, {
 					from: same,
 					reason: resumeReason,
+					allowWhenAutoContinueDisabled: allowRecoveryResume,
 				});
+				if (
+					!resumed &&
+					!hasPendingResume() &&
+					epoch === chainEpoch &&
+					!sessionClosed &&
+					!userAbortedChain
+				) {
+					setPendingContinuation(
+						ctx,
+						sourceModel,
+						`${SELECTED_FALLBACK_PENDING_PREFIX} ${resumeReason ?? "retry continuation"}`,
+						{ mode: pendingMode },
+					);
+				}
 				return;
 			}
 			schedulePendingWake(ctx);
 			return;
 		}
 
-		const pendingReason = pendingResume?.reason ?? "";
+		const pendingReason = pendingSnapshot?.reason ?? "";
 		const now = Date.now();
 		const sourceRef = ref(sourceModel.provider, sourceModel.id);
 		const sourceRecovered =
@@ -8545,10 +8655,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// The original account came back and there is no alternative: this is also a
 				// same-account resume with no switch record.
 				if (epoch !== chainEpoch || sessionClosed) return;
-				await resumeWithExistingContext(ctx, {
+				const resumed = await resumeWithExistingContext(ctx, {
 					from: sourceRef,
-					reason: pendingResume?.reason,
+					reason: pendingReason,
+					allowWhenAutoContinueDisabled: allowRecoveryResume,
 				});
+				if (
+					!resumed &&
+					!hasPendingResume() &&
+					epoch === chainEpoch &&
+					!sessionClosed &&
+					!userAbortedChain
+				) {
+					setPendingContinuation(
+						ctx,
+						sourceModel,
+						`${SELECTED_FALLBACK_PENDING_PREFIX} ${pendingReason || "quota recovery"}`,
+						{ mode: pendingMode },
+					);
+				}
 				return;
 			}
 			// Nothing to move to. The wait itself achieved nothing, so slow it down before the
@@ -8558,7 +8683,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 
-		const reason = pendingResume?.reason ?? "account cooldown expired";
+		const reason = pendingReason || "account cooldown expired";
 		const switched = await activateFallback(
 			ctx,
 			sourceModel,
@@ -8576,7 +8701,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// precisely the move that used to be free and therefore unbounded.
 		pendingResumeHops++;
 		clearPendingContinuation();
-		const dispatched = await maybeDispatchContinuation(ctx);
+		const dispatched = await maybeDispatchContinuation(ctx, {
+			allowWhenAutoContinueDisabled: allowRecoveryResume,
+			pendingMode,
+		});
 		if (epoch !== chainEpoch) return;
 		if (dispatched) resetPendingWakeBackoff();
 		else growPendingWakeBackoff();
@@ -8586,25 +8714,33 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		ctx: any,
 		failedModel: any,
 		reason: string,
-		retryDelayMs = config.transientCooldownMs,
+		options: {
+			mode?: PendingResumeMode;
+			retryDelayMs?: number;
+		} = {},
 	) {
 		// A stop that leaves an armed resume behind in the state file is not a stop: the next
 		// session reads it, `status` reports work pending, and the user is told something is
 		// waiting to continue when nothing is.
-		if (governorStopped() || isBreakerOpen()) return;
+		if (governorStopped() || isBreakerOpen() || userAbortedChain) return;
 		const from = ref(failedModel.provider, failedModel.id);
 		const alreadyPending = hasPendingResume();
+		const mode = options.mode ?? "auto-continue";
 		pendingResume = {
 			from,
 			reason,
+			mode,
 			since: pendingResume?.since ?? Date.now(),
 			// Backoff belongs to this attempt, never shared account/quota health.
-			retryAt: isTransientPendingReason(reason) ? Date.now() + retryDelayMs : undefined,
+			retryAt: isTransientPendingReason(reason)
+				? Date.now() + (options.retryDelayMs ?? config.transientCooldownMs)
+				: undefined,
 		};
 		logEvent("pending_resume_set", {
 			session: sessionInstanceId,
 			from,
 			reason,
+			mode,
 		});
 		persistedState = {
 			...persistedState,
@@ -8676,7 +8812,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx,
 			failedModel,
 			`${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`,
-			retryDelayMs,
+			{ retryDelayMs },
 		);
 	}
 
@@ -9011,6 +9147,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			refreshDiscovery(true, ctx);
 			startUsageStatusTimer(ctx);
+			if (hasPendingResume()) {
+				if (pendingResumeEnabled()) schedulePendingWake(ctx);
+				else clearPendingContinuation();
+			}
 			runBackground("reload account metadata refresh", ctx, async () => {
 				await refreshRotationUsage(ctx);
 				await syncCodexModelCatalog(ctx, true);
@@ -9724,7 +9864,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Cooldowns: ${cooldowns.length ? cooldowns.join(", ") : "none"}`,
 				`Next recovery: ${nextRecoveryStatus(ctx)}`,
 				`Invalidated (need re-login): ${invalids.length ? invalids.join(", ") : "none"}`,
-				`Pending auto-resume: ${hasPendingResume() ? `yes (reason: ${pendingResume?.reason ?? "unknown"})` : "none"}`,
+				`Continuation: immediate ${config.autoContinue ? "ON" : "OFF"} · after all-account quota recovery ${config.resumeAfterAllAccountsRecover ? "ON" : "OFF"}`,
+				`Pending auto-resume: ${hasPendingResume() ? `yes (${pendingResume?.mode ?? "unknown"}; reason: ${pendingResume?.reason ?? "unknown"})` : "none"}`,
 				`Queued user messages: ${queuedUserInputs.length}`,
 				`Resume watchdog: ${activeResumeWatch ? `watching${toolInFlight ? " · tool running" : ""}` : "idle"} · auto-recover ${config.autoRecoverStuck ? "ON" : "OFF"}`,
 				`Compaction routing: ${config.routeCompactionToHealthyAccount ? "to healthy account" : "off"}${compactionRoutedNote ? ` (last: ${compactionRoutedNote})` : ""}${lastContextOverflowAt ? ` · last overflow ${formatUntil(lastContextOverflowAt)}` : ""}`,
@@ -11322,7 +11463,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				model: ctx.model?.id,
 			});
 			ctx.ui.notify(
-				`pi-multi-account: no account is ready right now. Your message stays in Pi's transcript; if this request is refused, it will resume automatically when a compatible account recovers (next check in ~${formatDelay(delay)}).`,
+				config.resumeAfterAllAccountsRecover
+					? `pi-multi-account: no account is ready right now. Your message stays in Pi's transcript; if this request is refused, it will resume automatically when a compatible account recovers (next check in ~${formatDelay(delay)}).`
+					: `pi-multi-account: no account is ready right now. Your message stays in Pi's transcript, but resumeAfterAllAccountsRecover is off, so a refused request will not be resumed automatically.`,
 				"warning",
 			);
 			return { action: "continue" as const };
@@ -11700,7 +11843,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					failedModel,
 					`external provider out of quota: ${errorText.slice(0, 100)}`,
 					accountLevel ? config.cooldownMs : config.transientCooldownMs,
-					{ scope: accountLevel ? "provider" : "model" },
+					{
+						scope: accountLevel ? "provider" : "model",
+						waitForQuotaRecovery: failureKind === "limit",
+					},
 				);
 			}
 			return;
@@ -11785,6 +11931,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				failedModel,
 				`assistant error: ${errorText.slice(0, 120)}`,
 				cooldownMs,
+				{ waitForQuotaRecovery: true },
 			);
 			return;
 		}
@@ -11854,7 +12001,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (continuationDispatchedForAgentTurn) {
 			continuationDispatchedForAgentTurn = false;
-			return;
+			// The continuation itself may have hit quota and message_end may already have
+			// selected another account. Suppress only a duplicate end for the same attempt;
+			// never suppress the new switch that now needs its own continuation.
+			if (!currentPromptSwitch) return;
 		}
 		if (!config.enabled || !config.autoContinue || userAbortedChain) return;
 		await maybeDispatchContinuation(ctx);
