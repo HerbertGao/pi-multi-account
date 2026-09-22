@@ -13,6 +13,7 @@ import {
 	xaiUserIdFromAccessToken,
 	XAI_SUBSCRIPTION_USAGE_URL,
 	parseCodexUsageHeaders,
+	mergeUsageSnapshot,
 	parseCursorCurrentPeriodUsage,
 	parseCursorSandUsage,
 	parseOllamaMeBody,
@@ -183,6 +184,100 @@ test("parses case-insensitive Codex response headers", () => {
 	assert.equal(snapshot.primary?.windowSeconds, 18_000);
 	assert.equal(snapshot.secondary?.windowSeconds, 604_800);
 	assert.equal(formatUsageCompact(snapshot, NOW), "Codex A4 | 5h 27% left/30m | 7d 91% left/1d");
+});
+
+test("preserves Codex identity metadata when headers refresh quota windows", () => {
+	const body = parseCodexUsageBody(
+		"openai-codex-account-2",
+		{
+			plan_type: "pro",
+			email: "second@example.com",
+			rate_limit: {
+				primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+				secondary_window: { used_percent: 20, reset_at: NOW / 1000 + 86_400 },
+			},
+			credits: { has_credits: false, unlimited: false, balance: "0" },
+		},
+		NOW,
+		"same-credential",
+	);
+	const headers = parseCodexUsageHeaders(
+		"openai-codex-account-2",
+		{
+			"x-codex-primary-used-percent": "25",
+			"x-codex-primary-reset-at": String(NOW / 1000 + 7200),
+		},
+		NOW + 1_000,
+		"same-credential",
+	);
+	assert.ok(body);
+	assert.ok(headers);
+	const merged = mergeUsageSnapshot(body, headers);
+	assert.equal(merged.account, "second@example.com");
+	assert.equal(merged.plan, "pro");
+	assert.equal(merged.primary?.usedPercent, 25);
+	assert.equal(merged.secondary?.usedPercent, 20);
+	assert.equal(merged.credits?.hasCredits, false);
+	assert.equal(merged.credits?.unlimited, false);
+	assert.equal(merged.credits?.balance, "0");
+	assert.deepEqual(mergeUsageSnapshot(undefined, headers), headers);
+});
+
+test("preserves explicit credit booleans from a full response when headers omit them", () => {
+	const previous = parseCodexUsageBody(
+		"openai-codex-account-2",
+		{
+			plan_type: "pro",
+			rate_limit: {
+				primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+			},
+			credits: { has_credits: true, unlimited: true, balance: "0" },
+		},
+		NOW,
+		"same-credential",
+	);
+	const next = parseCodexUsageHeaders(
+		"openai-codex-account-2",
+		{
+			"x-codex-primary-used-percent": "25",
+			"x-codex-primary-reset-at": String(NOW / 1000 + 7200),
+		},
+		NOW + 1_000,
+		"same-credential",
+	);
+	assert.ok(previous);
+	assert.ok(next);
+	const merged = mergeUsageSnapshot(previous, next);
+	assert.equal(merged.credits?.hasCredits, true);
+	assert.equal(merged.credits?.unlimited, true);
+	assert.equal(merged.credits?.balance, "0");
+});
+
+test("does not carry identity across credential changes", () => {
+	const previous = parseCodexUsageBody(
+		"openai-codex-account-2",
+		{
+			plan_type: "pro",
+			email: "old@example.com",
+			rate_limit: {
+				primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+			},
+		},
+		NOW,
+		"old-credential",
+	);
+	const next = parseCodexUsageHeaders(
+		"openai-codex-account-2",
+		{
+			"x-codex-primary-used-percent": "25",
+			"x-codex-primary-reset-at": String(NOW / 1000 + 7200),
+		},
+		NOW + 1_000,
+		"new-credential",
+	);
+	assert.ok(previous);
+	assert.ok(next);
+	assert.equal(mergeUsageSnapshot(previous, next).account, undefined);
 });
 
 test("parses Anthropic OAuth usage windows", () => {

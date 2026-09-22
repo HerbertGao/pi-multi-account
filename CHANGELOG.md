@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex response-header quota refreshes now preserve account identity, plan, and credit metadata learned from the fuller usage response, so the footer no longer loses an account alias/email between refreshes.
 - A continuation that exhausted its newly selected fallback no longer stops after one hop: the next quota-driven switch receives its own continuation.
 - Asynchronous rejection of Pi's injected follow-up no longer loses the interrupted task; the selected fallback remains armed for a bounded retry.
 - `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.

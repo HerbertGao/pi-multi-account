@@ -474,6 +474,7 @@ import {
 	formatUsageCompact,
 	formatUsageDetails,
 	parseCodexUsageHeaders,
+	mergeUsageSnapshot,
 	providerUsageLabel,
 	remainingPercent,
 	usageColor,
@@ -5392,6 +5393,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function storeUsage(ctx: any, snapshot: UsageSnapshot): boolean {
 		if (!usageSnapshotIsCurrent(snapshot)) return false;
+		snapshot = mergeUsageSnapshot(usageByProvider.get(snapshot.provider), snapshot);
 		usageByProvider.set(snapshot.provider, snapshot);
 		usageErrors.delete(snapshot.provider);
 		// AUTHORITATIVE PROACTIVE BENCH. If the account's own usage endpoint reports a hard block (a

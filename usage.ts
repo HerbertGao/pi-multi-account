@@ -192,6 +192,11 @@ function headerValue(headers: unknown, name: string): string | undefined {
 	return undefined;
 }
 
+function headerBoolean(headers: unknown, name: string): boolean | undefined {
+	const value = headerValue(headers, name)?.toLowerCase();
+	return value === undefined ? undefined : value === "true";
+}
+
 function headerWindow(headers: unknown, prefix: "primary" | "secondary"): UsageWindow | undefined {
 	const usedPercent = percent(headerValue(headers, `x-codex-${prefix}-used-percent`));
 	const resetAt = epochMs(headerValue(headers, `x-codex-${prefix}-reset-at`));
@@ -222,8 +227,8 @@ export function parseCodexUsageHeaders(
 		primary,
 		secondary,
 		credits: {
-			hasCredits: headerValue(headers, "x-codex-credits-has-credits")?.toLowerCase() === "true",
-			unlimited: headerValue(headers, "x-codex-credits-unlimited")?.toLowerCase() === "true",
+			hasCredits: headerBoolean(headers, "x-codex-credits-has-credits"),
+			unlimited: headerBoolean(headers, "x-codex-credits-unlimited"),
 			balance: headerValue(headers, "x-codex-credits-balance"),
 		},
 	};
@@ -1007,6 +1012,43 @@ export function windowLabel(
 	if (seconds >= 6 * 86_400) return "7d";
 	if (seconds >= 20 * 3_600) return "24h";
 	return `${Math.max(1, Math.round(seconds / 3_600))}h`;
+}
+
+/**
+ * Merge a partial provider update without discarding metadata from a fuller snapshot.
+ *
+ * Codex usage responses include account/plan/credits metadata, while response headers only
+ * carry quota windows. Header snapshots arrive after the response-body snapshot and must not
+ * make the footer forget the account identity it just learned.
+ */
+export function mergeUsageSnapshot(
+	previous: UsageSnapshot | undefined,
+	next: UsageSnapshot,
+): UsageSnapshot {
+	if (
+		!previous ||
+		previous.provider !== next.provider ||
+		previous.credentialHash !== next.credentialHash
+	)
+		return next;
+	return {
+		...previous,
+		...next,
+		primary: next.primary ?? previous.primary,
+		secondary: next.secondary ?? previous.secondary,
+		tertiary: next.tertiary ?? previous.tertiary,
+		account: next.account ?? previous.account,
+		plan: next.plan ?? previous.plan,
+		serviceable: next.serviceable ?? previous.serviceable,
+		credits:
+			previous.credits || next.credits
+				? {
+						hasCredits: next.credits?.hasCredits ?? previous.credits?.hasCredits,
+						unlimited: next.credits?.unlimited ?? previous.credits?.unlimited,
+						balance: next.credits?.balance ?? previous.credits?.balance,
+				  }
+				: undefined,
+	};
 }
 
 export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): string {
